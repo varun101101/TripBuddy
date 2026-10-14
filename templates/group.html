@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TripBuddy Group Trip</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/group.css">
+</head>
+<body>
+  <div class="page-bg">
+    <div class="gradient-circle circle-1"></div>
+    <div class="gradient-circle circle-2"></div>
+    <div class="gradient-circle circle-3"></div>
+  </div>
+
+  <main class="app-container">
+    <section class="hero-section compact">
+      <a class="badge" href="/">&larr; Solo planner</a>
+      <h1>Plan a trip together</h1>
+      <p>Everyone adds their own budget, dates and must-see places. TripBuddy merges them,
+        flags clashes, and the plan is final only when the group approves it.</p>
+    </section>
+
+    <!-- Create a trip (shown at /group) -->
+    <section id="createView" class="planner-card hidden">
+      <div class="card-header">
+        <div>
+          <span class="eyebrow">Step 1</span>
+          <h2>Start a group trip</h2>
+          <p>You'll get a link to share with your friends.</p>
+        </div>
+      </div>
+      <form id="createForm" class="form-grid" novalidate>
+        <label class="span-2">Trip title
+          <input name="title" maxlength="80" required placeholder="Manali in December">
+        </label>
+        <label class="span-2">What kind of trip?
+          <textarea name="description" class="short" maxlength="600" required
+            placeholder="Snow, cafes and a relaxed pace. Mountain views, not too much trekking."></textarea>
+        </label>
+        <label>Trip length (days)
+          <input name="trip_days" type="number" min="1" max="30" placeholder="7">
+        </label>
+        <label>How is the plan approved?
+          <select name="approval_rule">
+            <option value="all">Everyone must approve</option>
+            <option value="majority">More than half must approve</option>
+          </select>
+        </label>
+        <h3 class="span-2 form-subhead">Your details (organiser)</h3>
+        <div class="span-2 member-fields" data-fields="organiser"></div>
+        <div class="span-2 form-actions">
+          <button type="submit" class="primary-btn">Create trip and get link</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Join a trip (shown at /trip/{id} for people who haven't joined) -->
+    <section id="joinView" class="planner-card hidden">
+      <div class="card-header">
+        <div>
+          <span class="eyebrow">You're invited</span>
+          <h2 id="joinTitle">Group trip</h2>
+          <p id="joinDescription"></p>
+          <p id="joinMembers" class="muted-line"></p>
+        </div>
+      </div>
+      <p id="joinClosed" class="notice hidden">Planning has already started, so this trip isn't taking new members.</p>
+      <form id="joinForm" class="form-grid" novalidate>
+        <div class="span-2 member-fields" data-fields="join"></div>
+        <div class="span-2 form-actions">
+          <button type="submit" class="primary-btn">Join trip</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Trip dashboard (members) -->
+    <div id="tripView" class="hidden">
+      <section class="planner-card">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">Group trip</span>
+            <h2 id="tripTitle"></h2>
+            <p id="tripDescription"></p>
+            <p id="tripMeta" class="muted-line"></p>
+          </div>
+          <span id="statusPill" class="trip-status"></span>
+        </div>
+        <div class="share-box">
+          <span>Share this link so friends can join:</span>
+          <input id="shareLink" readonly>
+          <button type="button" class="copy-btn" id="copyLinkBtn">Copy link</button>
+        </div>
+      </section>
+
+      <section class="workflow-section">
+        <div class="workflow-header">
+          <div>
+            <span class="eyebrow">Who's going</span>
+            <h2 id="membersHeading">Members</h2>
+          </div>
+          <button type="button" id="editMeBtn" class="copy-btn hidden">Edit my details</button>
+        </div>
+        <div id="membersList" class="member-cards"></div>
+        <form id="editForm" class="form-grid edit-form hidden" novalidate>
+          <h3 class="span-2 form-subhead">Edit my details</h3>
+          <div class="span-2 member-fields" data-fields="edit"></div>
+          <div class="span-2 form-actions">
+            <button type="submit" class="primary-btn">Save my details</button>
+            <button type="button" id="cancelEditBtn" class="copy-btn">Cancel</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="workflow-section">
+        <div class="workflow-header">
+          <div>
+            <span class="eyebrow">Group rules &middot; worked out by code, no AI</span>
+            <h2>What the plan must respect</h2>
+          </div>
+        </div>
+        <dl id="rulesList" class="rules-list"></dl>
+        <ul id="conflictList" class="issue-list conflict"></ul>
+        <ul id="warningList" class="issue-list warning"></ul>
+        <div id="planControls" class="plan-controls"></div>
+      </section>
+
+      <section id="workingBox" class="workflow-section working hidden">
+        <span class="loader"></span>
+        <div>
+          <strong id="workingTitle">The agents are planning your trip</strong>
+          <p>This usually takes one to two minutes. This page updates by itself.</p>
+        </div>
+      </section>
+
+      <section id="executionSection" class="workflow-section hidden">
+        <div class="workflow-header">
+          <div>
+            <span class="eyebrow">Supervisor agent</span>
+            <h2>Execution plan</h2>
+          </div>
+          <span id="guardrailBadge" class="guardrail-badge">Guardrail passed</span>
+        </div>
+        <p id="supervisorReasoning" class="supervisor-reasoning"></p>
+        <div id="agentChips" class="agent-chips"></div>
+      </section>
+
+      <section id="planSection" class="result-section hidden">
+        <div class="result-header">
+          <div>
+            <h2 id="planTitle">Draft plan</h2>
+            <p id="planMeta"></p>
+          </div>
+          <div class="result-actions">
+            <button class="copy-btn" type="button" id="copyPlanBtn">Copy</button>
+            <button class="download-btn" type="button" id="downloadBtn">Download PDF</button>
+          </div>
+        </div>
+        <div id="pdfContent" class="pdf-content">
+          <h1 class="pdf-title" id="pdfTitle">Group Travel Plan</h1>
+          <div id="planBox" class="result-box"></div>
+        </div>
+      </section>
+
+      <section id="voteSection" class="approval-section hidden">
+        <div class="approval-icon">&#128101;</div>
+        <div class="approval-content">
+          <span class="eyebrow" id="roundLabel">Group vote</span>
+          <h2>Review the draft and vote</h2>
+          <p id="voteRule"></p>
+          <ul id="voteStatus" class="vote-status"></ul>
+          <p id="myVoteNote" class="muted-line"></p>
+          <textarea id="voteFeedback" class="feedback-input" maxlength="600"
+            placeholder="What should change? For example: a cheaper hotel, or a free afternoon on day 3."></textarea>
+          <div class="approval-actions">
+            <button id="approveBtn" class="approve-btn" type="button">Approve draft</button>
+            <button id="reviseBtn" class="revise-btn" type="button">Ask for changes</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <section id="errorBox" class="error-box hidden" role="alert"></section>
+  </main>
+
+  <footer>TripBuddy group mode &middot; LangGraph, MCP, PostgreSQL</footer>
+
+  <template id="memberFieldsTemplate">
+    <div class="form-grid inner">
+      <label>Your name
+        <input name="name" maxlength="40" required placeholder="Varun">
+      </label>
+      <label>Starting city
+        <input name="origin" maxlength="60" placeholder="Ahmedabad">
+      </label>
+      <label>Max budget per person (&#8377;)
+        <input name="budget_max" type="number" min="1" step="500" placeholder="40000">
+      </label>
+      <label>Food
+        <select name="food_pref">
+          <option value="no_preference">No preference</option>
+          <option value="vegetarian">Vegetarian</option>
+          <option value="jain">Jain</option>
+          <option value="vegan">Vegan</option>
+          <option value="non_vegetarian">Non-vegetarian</option>
+        </select>
+      </label>
+      <label>Free from
+        <input name="available_from" type="date">
+      </label>
+      <label>Free until
+        <input name="available_to" type="date">
+      </label>
+      <label class="span-2">Must-see places <small>(separate with commas)</small>
+        <input name="must_see" maxlength="500" placeholder="Solang Valley, Old Manali cafes">
+      </label>
+      <label class="span-2">Anything else? <small>(optional)</small>
+        <input name="notes" maxlength="300" placeholder="No overnight buses, please">
+      </label>
+    </div>
+  </template>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  <script src="/static/group.js"></script>
+</body>
+</html>

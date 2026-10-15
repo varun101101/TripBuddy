@@ -1,0 +1,323 @@
+diff --git a/app.py b/app.py
+index 08e2b12..defeafa 100644
+--- a/app.py
++++ b/app.py
+@@ -277,6 +277,8 @@ def _trip_view(trip_id: str, member_id: str | None) -> JSONResponse:
+     round_no = trip["current_round"]
+     votes = store.votes_for_round(trip_id, round_no) if round_no else []
+     voted_names = {v["name"] for v in votes}
++    # What the group asked for last round, so voters can check the revision
++    previous_votes = store.votes_for_round(trip_id, round_no - 1) if round_no and round_no > 1 else []
+ 
+     return JSONResponse(content={
+         "success": True,
+@@ -297,6 +299,7 @@ def _trip_view(trip_id: str, member_id: str | None) -> JSONResponse:
+         "preview": preview,
+         "plan": plan,
+         "votes": votes,
++        "previous_votes": previous_votes,
+         "waiting_for": [m["name"] for m in members if round_no and m["name"] not in voted_names],
+     })
+ 
+diff --git a/backend.py b/backend.py
+index 688c106..660a9c1 100644
+--- a/backend.py
++++ b/backend.py
+@@ -732,7 +732,9 @@ The user requested a revision. Apply this feedback carefully:
+             if feedback:
+                 review_instruction += (
+                     "\nSome members still asked for small changes. Apply them only "
+-                    f"where they don't break a group rule:\n{feedback}"
++                    f"where they don't break a group rule:\n{feedback}\n"
++                    "In the Group Summary, say how each of these requests was handled "
++                    "(applied, or why it couldn't be)."
+                 )
+         else:
+             review_instruction = f"""
+diff --git a/static/group.css b/static/group.css
+index 3b89d32..36dfea5 100644
+--- a/static/group.css
++++ b/static/group.css
+@@ -348,6 +348,26 @@ textarea.short {
+   max-width: 420px;
+ }
+ 
++.previous-requests {
++  margin-top: 14px;
++  padding: 12px 14px;
++  border-radius: 14px;
++  border: 1px solid rgba(96, 165, 250, 0.35);
++  background: rgba(37, 99, 235, 0.1);
++  color: #dbeafe;
++}
++
++.previous-requests .previous-title {
++  margin: 0 0 6px;
++  color: #bfdbfe;
++  font-weight: 750;
++}
++
++.previous-requests ul {
++  margin: 0 0 6px 18px;
++  line-height: 1.6;
++}
++
+ @media (max-width: 760px) {
+   .form-grid {
+     grid-template-columns: 1fr;
+diff --git a/static/group.js b/static/group.js
+index 9bf09d4..e1d72d0 100644
+--- a/static/group.js
++++ b/static/group.js
+@@ -317,8 +317,9 @@ function renderPlan(view) {
+   show("planSection", showPlan);
+   if (!showPlan) return;
+ 
++  const unagreed = status === "completed" && plan.approved === false;
+   let title = "Draft plan";
+-  if (status === "completed") title = "Final group plan";
++  if (status === "completed") title = unagreed ? "Final group plan (no full agreement)" : "Final group plan";
+   else if (status === "needs_changes") title = "Planning stopped";
+   else if (status === "blocked") title = "Request blocked";
+   else if (status === "awaiting_votes" || status === "processing") {
+@@ -328,6 +329,10 @@ function renderPlan(view) {
+   $("pdfTitle").textContent = view.trip.title;
+   const meta = [];
+   if (plan.vote_summary && status === "completed") meta.push(`Vote: ${plan.vote_summary}`);
++  if (unagreed) {
++    meta.push(`The group didn't agree after ${view.trip.max_revisions + 1} rounds, so this plan applies ` +
++      "the last round's requests as far as the group rules allow");
++  }
+   if (plan.llm_calls) meta.push(`${plan.llm_calls} model calls`);
+   $("planMeta").textContent = meta.join(" · ");
+ 
+@@ -344,6 +349,26 @@ function renderPlan(view) {
+   }
+ }
+ 
++// From round 2 on, show what the group asked for last round, so voters can
++// check the "What changed" list at the top of the draft against it.
++function renderPreviousRequests(view) {
++  const box = $("previousRequests");
++  const requests = (view.previous_votes || []).filter((v) => v.feedback);
++  show("previousRequests", view.trip.current_round > 1 && requests.length > 0);
++  if (!requests.length) return;
++  const heading = el("p", { class: "previous-title" },
++    `This draft was revised for round ${view.trip.current_round - 1}'s requests:`);
++  const items = el("ul");
++  for (const v of requests) {
++    const li = el("li");
++    li.append(el("strong", {}, `${v.name}${v.decision === "approve" ? " (approved)" : ""}: `),
++      document.createTextNode(v.feedback));
++    items.appendChild(li);
++  }
++  const hint = el("p", { class: "muted-line" }, 'Check the "What changed" list at the top of the draft.');
++  box.replaceChildren(heading, items, hint);
++}
++
+ function renderVote(view) {
+   const trip = view.trip;
+   const open = trip.status === "awaiting_votes";
+@@ -357,6 +382,8 @@ function renderVote(view) {
+     ? `${trip.approval_rule_label}. This is the last round: after it, the plan is finalised either way, applying everyone's requests where the group rules allow.`
+     : `${trip.approval_rule_label}. If the draft isn't approved, the itinerary agent revises it using everyone's requests.`;
+ 
++  renderPreviousRequests(view);
++
+   const list = $("voteStatus");
+   list.replaceChildren();
+   const votesByName = Object.fromEntries(view.votes.map((v) => [v.name, v]));
+@@ -404,7 +431,10 @@ function renderDashboard(view) {
+   $("tripMeta").textContent =
+     `${trip.approval_rule_label}${trip.trip_days ? ` · ${trip.trip_days} days` : ""} · You are ${you}`;
+ 
+-  const [label, tone] = STATUS[trip.status] || [trip.status, ""];
++  let [label, tone] = STATUS[trip.status] || [trip.status, ""];
++  if (trip.status === "completed" && view.plan && view.plan.approved === false) {
++    [label, tone] = ["Final plan · no full agreement", "wait"];
++  }
+   const pill = $("statusPill");
+   pill.textContent = label;
+   pill.className = `trip-status ${tone}`;
+@@ -541,8 +571,9 @@ async function downloadPdf() {
+   const plan = app.view.plan || {};
+   const slug = (trip.title || "trip").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+   const today = new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
++  const finalLabel = plan.approved === false ? "Final group plan (no full agreement)" : "Final group plan";
+   const stage = trip.status === "completed"
+-    ? `Final group plan${plan.vote_summary ? ` · ${plan.vote_summary}` : ""}`
++    ? `${finalLabel}${plan.vote_summary ? ` · ${plan.vote_summary}` : ""}`
+     : `Draft plan · voting round ${trip.current_round}`;
+   const button = $("downloadBtn");
+   button.disabled = true;
+diff --git a/templates/group.html b/templates/group.html
+index 7f9e009..d708e12 100644
+--- a/templates/group.html
++++ b/templates/group.html
+@@ -19,7 +19,7 @@
+       <a class="badge" href="/">&larr; Solo planner</a>
+       <h1>Plan a trip together</h1>
+       <p>Everyone adds their own budget, dates and must-see places. TripBuddy merges them,
+-        flags clashes, and the plan is final only when the group approves it.</p>
++        flags clashes, and the group votes on every draft until it agrees (up to 3 rounds).</p>
+     </section>
+ 
+     <!-- Create a trip (shown at /group) -->
+@@ -169,6 +169,7 @@
+           <span class="eyebrow" id="roundLabel">Group vote</span>
+           <h2>Review the draft and vote</h2>
+           <p id="voteRule"></p>
++          <div id="previousRequests" class="previous-requests hidden"></div>
+           <ul id="voteStatus" class="vote-status"></ul>
+           <p id="myVoteNote" class="muted-line"></p>
+           <textarea id="voteFeedback" class="feedback-input" maxlength="600"
+diff --git a/tests/test_group_voting.py b/tests/test_group_voting.py
+new file mode 100644
+index 0000000..5a97681
+--- /dev/null
++++ b/tests/test_group_voting.py
+@@ -0,0 +1,144 @@
++"""
++Group voting scenarios: what happens to change requests.
++
++The fake itinerary agent copies the requests it is given into its revised
++draft ("What changed: ..."), so these tests can check that the draft the
++group votes on next really contains every requested change.
++
++Run with:
++    TEST_DATABASE_URL=postgresql://user:pass@localhost/tripbuddy_test?sslmode=disable \
++        python -m pytest tests/test_group_voting.py -q
++"""
++
++import os
++import re
++import sys
++
++import pytest
++
++TEST_DB = os.getenv("TEST_DATABASE_URL")
++pytestmark = pytest.mark.skipif(not TEST_DB, reason="set TEST_DATABASE_URL to run")
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++from test_group_api import create_trip, env, join, person, vote  # noqa: E402,F401
++
++
++@pytest.fixture
++def echoing_planner(env):
++    """Revised drafts list the requests they were given, like a model that applies them."""
++    llm = env["llm"]
++    real = llm.invoke
++
++    def invoke(messages):
++        reply = real(messages)
++        if isinstance(messages, str) or "expert travel planner" not in messages[0].content:
++            return reply
++        prompt = messages[-1].content
++        match = re.search(r"Requested changes, by member:\n(.*?)\n\nPrevious draft:", prompt, re.S)
++        if match:
++            from langchain_core.messages import AIMessage
++            return AIMessage(content=f"{reply.content.splitlines()[0]}\nWhat changed:\n{match.group(1)}")
++        return reply
++
++    llm.invoke = invoke
++    yield llm
++    llm.invoke = real
++
++
++def view_of(client, trip_id, member):
++    return client.get(f"/api/trips/{trip_id}", params={"member_id": member}).json()
++
++
++def three_member_trip(client, rule="all"):
++    trip_id, varun = create_trip(client, rule=rule)
++    riya = join(client, trip_id, person("Riya"))
++    aman = join(client, trip_id, person("Aman"))
++    r = client.post(f"/api/trips/{trip_id}/plan", json={"member_id": varun})
++    assert r.json()["trip"]["status"] == "awaiting_votes"
++    return trip_id, varun, riya, aman
++
++
++def last_prompt(llm, system_word):
++    return [p for s, p in llm.prompts if system_word in s][-1]
++
++
++def test_everyone_asks_for_changes_and_the_next_draft_has_them(env, echoing_planner):
++    client, llm = env["client"], echoing_planner
++    trip_id, varun, riya, aman = three_member_trip(client)
++    first_draft = view_of(client, trip_id, varun)["plan"]["answer"]
++
++    vote(client, trip_id, varun, "revise", "Add a rest day")
++    vote(client, trip_id, riya, "revise", "Cheaper hotel")
++    view = vote(client, trip_id, aman, "revise", "More street food").json()
++
++    # The agents rewrote the draft with all three requests before the next vote
++    prompt = last_prompt(llm, "expert travel planner")
++    assert "REVISION 1 of 2" in prompt
++    for line in ("- Varun: Add a rest day", "- Riya: Cheaper hotel", "- Aman: More street food"):
++        assert line in prompt
++    assert first_draft in prompt  # the previous draft is what gets revised
++
++    assert view["trip"]["status"] == "awaiting_votes"
++    assert view["trip"]["current_round"] == 2
++    draft = view["plan"]["answer"]
++    assert draft != first_draft
++    for request in ("Add a rest day", "Cheaper hotel", "More street food"):
++        assert request in draft  # the draft now being voted on has every change
++
++    # Voters can see what the previous round asked for
++    asked = {(v["name"], v["feedback"]) for v in view["previous_votes"]}
++    assert asked == {("Varun", "Add a rest day"), ("Riya", "Cheaper hotel"), ("Aman", "More street food")}
++    assert view["votes"] == []  # round 2 starts empty
++
++    for member in (varun, riya):
++        vote(client, trip_id, member, "approve")
++    view = vote(client, trip_id, aman, "approve").json()
++    assert view["trip"]["status"] == "completed"
++    assert view["plan"]["approved"] is True
++    assert draft in last_prompt(llm, "booking assistant")  # the final plan polishes the revised draft
++
++
++def test_one_request_with_everyone_must_approve_starts_a_revision(env, echoing_planner):
++    client, llm = env["client"], echoing_planner
++    trip_id, varun, riya, aman = three_member_trip(client, rule="all")
++
++    vote(client, trip_id, varun, "approve")
++    vote(client, trip_id, riya, "approve")
++    view = vote(client, trip_id, aman, "revise", "Skip the scuba dive").json()
++
++    assert view["trip"]["status"] == "awaiting_votes" and view["trip"]["current_round"] == 2
++    assert "Skip the scuba dive" in view["plan"]["answer"]
++    assert "- Aman: Skip the scuba dive" in last_prompt(llm, "expert travel planner")
++
++
++def test_one_request_with_majority_rule_is_applied_in_the_final_plan(env, echoing_planner):
++    client, llm = env["client"], echoing_planner
++    trip_id, varun, riya, aman = three_member_trip(client, rule="majority")
++
++    vote(client, trip_id, varun, "approve")
++    vote(client, trip_id, riya, "approve")
++    view = vote(client, trip_id, aman, "revise", "Skip the scuba dive").json()
++
++    # 2 of 3 approved, so the plan is final, but Aman's request isn't dropped:
++    assert view["trip"]["status"] == "completed"
++    final_prompt = last_prompt(llm, "booking assistant")
++    assert "- Aman: Skip the scuba dive" in final_prompt
++    assert "Apply them only where they don't break a group rule" in final_prompt
++    assert "say how each of these requests was handled" in final_prompt
++
++
++def test_no_agreement_after_three_rounds_is_not_reported_as_approved(env, echoing_planner):
++    client, llm = env["client"], echoing_planner
++    trip_id, varun = create_trip(client)
++    bina = join(client, trip_id, person("Bina"))
++    client.post(f"/api/trips/{trip_id}/plan", json={"member_id": varun})
++    for round_no in (1, 2, 3):
++        vote(client, trip_id, varun, "approve")
++        view = vote(client, trip_id, bina, "revise", f"change {round_no}").json()
++
++    assert view["trip"]["status"] == "completed"
++    assert view["plan"]["approved"] is False  # the page must not say "approved"
++    final_prompt = last_prompt(llm, "booking assistant")
++    assert "did not approve after 2 revisions" in final_prompt
++    assert "- Bina: change 3" in final_prompt

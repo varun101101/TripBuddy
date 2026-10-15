@@ -317,8 +317,9 @@ function renderPlan(view) {
   show("planSection", showPlan);
   if (!showPlan) return;
 
+  const unagreed = status === "completed" && plan.approved === false;
   let title = "Draft plan";
-  if (status === "completed") title = "Final group plan";
+  if (status === "completed") title = unagreed ? "Final group plan (no full agreement)" : "Final group plan";
   else if (status === "needs_changes") title = "Planning stopped";
   else if (status === "blocked") title = "Request blocked";
   else if (status === "awaiting_votes" || status === "processing") {
@@ -328,6 +329,10 @@ function renderPlan(view) {
   $("pdfTitle").textContent = view.trip.title;
   const meta = [];
   if (plan.vote_summary && status === "completed") meta.push(`Vote: ${plan.vote_summary}`);
+  if (unagreed) {
+    meta.push(`The group didn't agree after ${view.trip.max_revisions + 1} rounds, so this plan applies ` +
+      "the last round's requests as far as the group rules allow");
+  }
   if (plan.llm_calls) meta.push(`${plan.llm_calls} model calls`);
   $("planMeta").textContent = meta.join(" · ");
 
@@ -344,6 +349,26 @@ function renderPlan(view) {
   }
 }
 
+// From round 2 on, show what the group asked for last round, so voters can
+// check the "What changed" list at the top of the draft against it.
+function renderPreviousRequests(view) {
+  const box = $("previousRequests");
+  const requests = (view.previous_votes || []).filter((v) => v.feedback);
+  show("previousRequests", view.trip.current_round > 1 && requests.length > 0);
+  if (!requests.length) return;
+  const heading = el("p", { class: "previous-title" },
+    `This draft was revised for round ${view.trip.current_round - 1}'s requests:`);
+  const items = el("ul");
+  for (const v of requests) {
+    const li = el("li");
+    li.append(el("strong", {}, `${v.name}${v.decision === "approve" ? " (approved)" : ""}: `),
+      document.createTextNode(v.feedback));
+    items.appendChild(li);
+  }
+  const hint = el("p", { class: "muted-line" }, 'Check the "What changed" list at the top of the draft.');
+  box.replaceChildren(heading, items, hint);
+}
+
 function renderVote(view) {
   const trip = view.trip;
   const open = trip.status === "awaiting_votes";
@@ -356,6 +381,8 @@ function renderVote(view) {
   $("voteRule").textContent = lastRound
     ? `${trip.approval_rule_label}. This is the last round: after it, the plan is finalised either way, applying everyone's requests where the group rules allow.`
     : `${trip.approval_rule_label}. If the draft isn't approved, the itinerary agent revises it using everyone's requests.`;
+
+  renderPreviousRequests(view);
 
   const list = $("voteStatus");
   list.replaceChildren();
@@ -404,7 +431,10 @@ function renderDashboard(view) {
   $("tripMeta").textContent =
     `${trip.approval_rule_label}${trip.trip_days ? ` · ${trip.trip_days} days` : ""} · You are ${you}`;
 
-  const [label, tone] = STATUS[trip.status] || [trip.status, ""];
+  let [label, tone] = STATUS[trip.status] || [trip.status, ""];
+  if (trip.status === "completed" && view.plan && view.plan.approved === false) {
+    [label, tone] = ["Final plan · no full agreement", "wait"];
+  }
   const pill = $("statusPill");
   pill.textContent = label;
   pill.className = `trip-status ${tone}`;
@@ -541,8 +571,9 @@ async function downloadPdf() {
   const plan = app.view.plan || {};
   const slug = (trip.title || "trip").toLowerCase().replace(/[^a-z0-9]+/g, "-");
   const today = new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+  const finalLabel = plan.approved === false ? "Final group plan (no full agreement)" : "Final group plan";
   const stage = trip.status === "completed"
-    ? `Final group plan${plan.vote_summary ? ` · ${plan.vote_summary}` : ""}`
+    ? `${finalLabel}${plan.vote_summary ? ` · ${plan.vote_summary}` : ""}`
     : `Draft plan · voting round ${trip.current_round}`;
   const button = $("downloadBtn");
   button.disabled = true;

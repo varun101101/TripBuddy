@@ -19,7 +19,7 @@
       <a class="badge" href="/">&larr; Solo planner</a>
       <h1>Plan a trip together</h1>
       <p>Everyone adds their own budget, dates and must-see places. TripBuddy merges them,
-        flags clashes, and the plan is final only when the group approves it.</p>
+        flags clashes, and the group votes on every draft until it agrees (up to 3 rounds).</p>
     </section>
 
     <!-- Create a trip (shown at /group) -->
@@ -169,6 +169,7 @@
           <span class="eyebrow" id="roundLabel">Group vote</span>
           <h2>Review the draft and vote</h2>
           <p id="voteRule"></p>
+          <div id="previousRequests" class="previous-requests hidden"></div>
           <ul id="voteStatus" class="vote-status"></ul>
           <p id="myVoteNote" class="muted-line"></p>
           <textarea id="voteFeedback" class="feedback-input" maxlength="600"

@@ -732,7 +732,9 @@ The user requested a revision. Apply this feedback carefully:
             if feedback:
                 review_instruction += (
                     "\nSome members still asked for small changes. Apply them only "
-                    f"where they don't break a group rule:\n{feedback}"
+                    f"where they don't break a group rule:\n{feedback}\n"
+                    "In the Group Summary, say how each of these requests was handled "
+                    "(applied, or why it couldn't be)."
                 )
         else:
             review_instruction = f"""

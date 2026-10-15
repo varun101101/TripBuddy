@@ -67,8 +67,16 @@ API Endpoints
 - `POST /api/travel/approve` — approve or request revisions for a draft. JSON: `{ "thread_id": "<id>", "approved": true|false, "feedback": "optional" }`
 - `GET /health` — basic health check and features list
 
+Accounts (optional, powered by Clerk)
+- Guests can use everything without signing up. A signed-in user gets every solo plan and group trip saved to **My trips** (`/my-trips`) and can reopen them on any device.
+- Clerk handles sign-up, log-in, Google sign-in, email verification and password reset; user accounts live at Clerk. TripBuddy's PostgreSQL stores trips and plans tagged with the Clerk user ID (`trip_members.clerk_user_id`, `solo_plans.clerk_user_id`).
+- The browser sends Clerk's short-lived session token with each `/api` call. The server verifies it with Clerk's public key (RS256 signature, expiry, and that it was issued for this site) and reads the user ID from the `sub` claim. See `accounts.py`.
+- `GET /api/me/trips` lists the user's group trips and solo plans; `GET /api/me/plans/{thread_id}` opens a saved solo plan.
+- New columns and tables are added alongside the existing schema; nothing existing is changed.
+
 Configuration & environment
 - Secrets and API keys are not included in the repo. Use environment variables or a `.env` file for any required keys consumed by `langgraph`, `langchain`, or other adapters.
+- Accounts: set `CLERK_PUBLISHABLE_KEY` in `.env` (from the Clerk dashboard's API keys page). Optional: `CLERK_JWT_KEY` (the dashboard's JWKS Public Key, PEM) to verify tokens without a network call. Without a publishable key TripBuddy runs in guest mode. Open the app at `http://localhost:8000`.
 - AI model: TripBuddy uses `openai/gpt-oss-120b` through OpenRouter. Set `OPENROUTER_API_KEY` in `.env`; `LLM_MODEL` optionally picks a different OpenRouter model.
 
 Development notes

@@ -1,0 +1,1631 @@
+diff --git a/README.md b/README.md
+index 9ba7912..1986232 100644
+--- a/README.md
++++ b/README.md
+@@ -67,8 +67,16 @@ API Endpoints
+ - `POST /api/travel/approve` — approve or request revisions for a draft. JSON: `{ "thread_id": "<id>", "approved": true|false, "feedback": "optional" }`
+ - `GET /health` — basic health check and features list
+ 
++Accounts (optional, powered by Clerk)
++- Guests can use everything without signing up. A signed-in user gets every solo plan and group trip saved to **My trips** (`/my-trips`) and can reopen them on any device.
++- Clerk handles sign-up, log-in, Google sign-in, email verification and password reset; user accounts live at Clerk. TripBuddy's PostgreSQL stores trips and plans tagged with the Clerk user ID (`trip_members.clerk_user_id`, `solo_plans.clerk_user_id`).
++- The browser sends Clerk's short-lived session token with each `/api` call. The server verifies it with Clerk's public key (RS256 signature, expiry, and that it was issued for this site) and reads the user ID from the `sub` claim. See `accounts.py`.
++- `GET /api/me/trips` lists the user's group trips and solo plans; `GET /api/me/plans/{thread_id}` opens a saved solo plan.
++- New columns and tables are added alongside the existing schema; nothing existing is changed.
++
+ Configuration & environment
+ - Secrets and API keys are not included in the repo. Use environment variables or a `.env` file for any required keys consumed by `langgraph`, `langchain`, or other adapters.
++- Accounts: set `CLERK_PUBLISHABLE_KEY` in `.env` (from the Clerk dashboard's API keys page). Optional: `CLERK_JWT_KEY` (the dashboard's JWKS Public Key, PEM) to verify tokens without a network call. Without a publishable key TripBuddy runs in guest mode. Open the app at `http://localhost:8000`.
+ - AI model: TripBuddy uses `openai/gpt-oss-120b` through OpenRouter. Set `OPENROUTER_API_KEY` in `.env`; `LLM_MODEL` optionally picks a different OpenRouter model.
+ 
+ Development notes
+diff --git a/accounts.py b/accounts.py
+new file mode 100644
+index 0000000..3341984
+--- /dev/null
++++ b/accounts.py
+@@ -0,0 +1,275 @@
++"""
++Accounts for TripBuddy, powered by Clerk.
++
++Who does what
++- Clerk handles sign-up, log-in, Google sign-in, email verification and
++  password reset. User accounts (names, emails, passwords) live at Clerk.
++- TripBuddy's PostgreSQL stores the trips and plans, each tagged with the
++  Clerk user ID of its owner (a string like "user_2abc...").
++
++How a request is recognised
++1. In the browser, Clerk issues a short-lived session token (a JWT signed
++   by Clerk with RS256). static/account.js attaches it to every /api call
++   as "Authorization: Bearer <token>".
++2. The server checks that token here, with Clerk's public key: the
++   signature, the expiry, and that it was issued for this site (azp).
++3. If it's valid, the token's "sub" claim is the Clerk user ID, and that ID
++   is used to save and find the user's trips.
++
++Accounts are optional. Guests can still use everything, and if Clerk isn't
++configured or can't be reached, TripBuddy simply works in guest mode.
++
++Database (added beside the existing tables; nothing existing changes, so
++older versions of the app keep working on the same database):
++- trip_members.clerk_user_id   which Clerk user a group-trip member is
++- solo_plans                   one row per solo plan a signed-in user made
++
++.env settings
++- CLERK_PUBLISHABLE_KEY   required to turn accounts on (pk_test_... / pk_live_...)
++- CLERK_JWT_KEY           optional: the "JWKS Public Key" (PEM) from the Clerk
++                          dashboard, to check tokens without a network call
++- CLERK_AUTHORIZED_PARTIES optional: extra site origins allowed to send
++                          tokens, comma separated. This site is always allowed.
++"""
++
++from __future__ import annotations
++
++import base64
++import os
++from functools import lru_cache
++from pathlib import Path
++from typing import Any
++
++import jwt
++import psycopg
++from cryptography.hazmat.primitives.serialization import load_pem_public_key
++from dotenv import load_dotenv
++from fastapi import Request
++
++from group_store import _clean, pool
++
++load_dotenv(Path(__file__).resolve().parent / ".env")
++
++SESSION_COOKIE = "__session"  # where Clerk keeps the token for same-site requests
++CLOCK_LEEWAY_SECONDS = 10     # Clerk tokens last ~60 s; allow small clock differences
++
++SCHEMA = [
++    "ALTER TABLE trip_members ADD COLUMN IF NOT EXISTS clerk_user_id TEXT",
++    """
++    CREATE UNIQUE INDEX IF NOT EXISTS trip_members_one_per_clerk_user
++        ON trip_members (trip_id, clerk_user_id) WHERE clerk_user_id IS NOT NULL
++    """,
++    "CREATE INDEX IF NOT EXISTS trip_members_by_clerk_user ON trip_members (clerk_user_id)",
++    """
++    CREATE TABLE IF NOT EXISTS solo_plans (
++        thread_id      TEXT PRIMARY KEY,
++        clerk_user_id  TEXT NOT NULL,
++        title          TEXT NOT NULL,
++        status         TEXT NOT NULL DEFAULT 'draft'
++                       CHECK (status IN ('draft', 'final', 'blocked')),
++        created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
++        updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
++    )
++    """,
++    "CREATE INDEX IF NOT EXISTS solo_plans_by_user ON solo_plans (clerk_user_id, created_at DESC)",
++]
++
++
++def setup() -> None:
++    """Create the account columns and tables. Run after group_store.setup()."""
++    with pool().connection() as conn:
++        for statement in SCHEMA:
++            conn.execute(statement)
++
++
++# ---------------------------------------------------------------------
++# Clerk settings
++# ---------------------------------------------------------------------
++def publishable_key() -> str:
++    return (os.getenv("CLERK_PUBLISHABLE_KEY") or "").strip()
++
++
++def frontend_api(key: str | None = None) -> str | None:
++    """
++    Clerk's Frontend API host for this app, e.g. "happy-cat-12.clerk.accounts.dev".
++    It is encoded inside the publishable key: pk_test_<base64(host + "$")>.
++    """
++    key = key if key is not None else publishable_key()
++    parts = key.split("_", 2)
++    if len(parts) != 3 or parts[0] != "pk":
++        return None
++    encoded = parts[2] + "=" * (-len(parts[2]) % 4)
++    try:
++        host = base64.b64decode(encoded).decode()
++    except (ValueError, UnicodeDecodeError):
++        return None
++    return host[:-1] if host.endswith("$") else None
++
++
++def enabled() -> bool:
++    return frontend_api() is not None
++
++
++def template_context() -> dict[str, Any]:
++    """What every page needs to load Clerk in the browser."""
++    host = frontend_api()
++    return {
++        "clerk_publishable_key": publishable_key() if host else "",
++        "clerk_frontend_api": host or "",
++    }
++
++
++@lru_cache(maxsize=4)
++def _jwks_client(host: str) -> jwt.PyJWKClient:
++    # Clerk publishes its public keys here; PyJWKClient caches them.
++    return jwt.PyJWKClient(f"https://{host}/.well-known/jwks.json", cache_keys=True)
++
++
++@lru_cache(maxsize=4)
++def _pem_key(pem: str):
++    return load_pem_public_key(pem.encode())
++
++
++def _signing_key(token: str):
++    pem = (os.getenv("CLERK_JWT_KEY") or "").strip().replace("\\n", "\n")
++    if pem:
++        return _pem_key(pem)  # checked offline, no network call
++    host = frontend_api()
++    if not host:
++        return None
++    return _jwks_client(host).get_signing_key_from_jwt(token).key
++
++
++def _allowed_origins(request: Request) -> set[str]:
++    own = str(request.base_url).rstrip("/")
++    extra = os.getenv("CLERK_AUTHORIZED_PARTIES") or ""
++    return {own, *(o.strip().rstrip("/") for o in extra.split(",") if o.strip())}
++
++
++def verify_session_token(token: str, request: Request) -> dict[str, Any] | None:
++    """Return the token's claims if Clerk really issued it for this site, else None."""
++    try:
++        key = _signing_key(token)
++        if key is None:
++            return None
++        claims = jwt.decode(
++            token,
++            key,
++            algorithms=["RS256"],               # never accept other algorithms
++            leeway=CLOCK_LEEWAY_SECONDS,        # also checks exp and nbf
++            options={"require": ["exp", "sub"], "verify_aud": False},
++        )
++    except jwt.PyJWKClientError as exc:
++        print(f"WARNING: couldn't fetch Clerk's public keys, treating request as a guest: {exc}")
++        return None
++    except jwt.PyJWTError:
++        return None
++    azp = claims.get("azp")
++    if azp and azp.rstrip("/") not in _allowed_origins(request):
++        return None  # token was made for a different website
++    if claims.get("sts") == "pending":
++        return None
++    return claims
++
++
++def current_user(request: Request) -> dict[str, Any] | None:
++    """The signed-in Clerk user for this request ({"user_id": ...}), or None for guests."""
++    if not enabled() and not os.getenv("CLERK_JWT_KEY"):
++        return None
++    header = request.headers.get("authorization") or ""
++    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
++    token = token or request.cookies.get(SESSION_COOKIE) or ""
++    if not token:
++        return None
++    claims = verify_session_token(token, request)
++    return {"user_id": claims["sub"]} if claims else None
++
++
++# ---------------------------------------------------------------------
++# Group trips owned by a Clerk user
++# ---------------------------------------------------------------------
++def link_member(trip_id: str, member_id: str, user_id: str) -> bool:
++    """
++    Attach a guest membership (joined before signing in, on this browser)
++    to the Clerk user. Only links a member that isn't linked yet, and only
++    if this user has no other membership in the same trip.
++    """
++    try:
++        with pool().connection() as conn:
++            cur = conn.execute(
++                """
++                UPDATE trip_members SET clerk_user_id = %(u)s
++                WHERE trip_id = %(t)s AND member_id = %(m)s AND clerk_user_id IS NULL
++                  AND NOT EXISTS (SELECT 1 FROM trip_members
++                                  WHERE trip_id = %(t)s AND clerk_user_id = %(u)s)
++                """,
++                {"t": trip_id, "m": member_id, "u": user_id},
++            )
++    except psycopg.errors.UniqueViolation:
++        return False
++    return cur.rowcount == 1
++
++
++# ---------------------------------------------------------------------
++# Solo plans saved for a Clerk user
++# ---------------------------------------------------------------------
++def save_plan(user_id: str, thread_id: str, title: str, status: str) -> None:
++    title = " ".join((title or "").split())[:120] or "Travel plan"
++    with pool().connection() as conn:
++        conn.execute(
++            """
++            INSERT INTO solo_plans (thread_id, clerk_user_id, title, status)
++            VALUES (%s, %s, %s, %s)
++            ON CONFLICT (thread_id) DO UPDATE
++                SET status = EXCLUDED.status, updated_at = now()
++                WHERE solo_plans.clerk_user_id = EXCLUDED.clerk_user_id
++            """,
++            (thread_id, user_id, title, status),
++        )
++
++
++def update_plan_status(thread_id: str, status: str) -> None:
++    with pool().connection() as conn:
++        conn.execute(
++            "UPDATE solo_plans SET status = %s, updated_at = now() WHERE thread_id = %s",
++            (status, thread_id),
++        )
++
++
++def get_saved_plan(user_id: str, thread_id: str) -> dict[str, Any] | None:
++    with pool().connection() as conn:
++        row = conn.execute(
++            "SELECT * FROM solo_plans WHERE thread_id = %s AND clerk_user_id = %s",
++            (thread_id, user_id),
++        ).fetchone()
++    return _clean(row)
++
++
++# ---------------------------------------------------------------------
++# "My trips"
++# ---------------------------------------------------------------------
++def my_trips(user_id: str) -> dict[str, list[dict[str, Any]]]:
++    with pool().connection() as conn:
++        group_rows = conn.execute(
++            """
++            SELECT t.trip_id, t.title, t.status, t.trip_days, t.created_at, t.updated_at,
++                   m.is_organiser,
++                   (SELECT count(*) FROM trip_members x WHERE x.trip_id = t.trip_id) AS members
++            FROM trip_members m JOIN trips t ON t.trip_id = m.trip_id
++            WHERE m.clerk_user_id = %s
++            ORDER BY t.updated_at DESC
++            """,
++            (user_id,),
++        ).fetchall()
++        plan_rows = conn.execute(
++            """
++            SELECT thread_id, title, status, created_at, updated_at
++            FROM solo_plans WHERE clerk_user_id = %s
++            ORDER BY created_at DESC
++            """,
++            (user_id,),
++        ).fetchall()
++    return {
++        "group_trips": [_clean(r) for r in group_rows],
++        "solo_plans": [_clean(r) for r in plan_rows],
++    }
+diff --git a/app.py b/app.py
+index aa3dbff..c212a13 100644
+--- a/app.py
++++ b/app.py
+@@ -17,6 +17,7 @@ from backend import (
+     run_group_plan,
+     run_travel_agent,
+ )
++import accounts
+ import group_store as store
+ from group_logic import APPROVAL_RULES, FOOD_PREFERENCES, MAX_REVISION_ROUNDS, merge_members
+ 
+@@ -62,12 +63,18 @@ async def home(request: Request):
+     return templates.TemplateResponse(
+         request=request,
+         name="index.html",
+-        context={},
++        context=accounts.template_context(),
+     )
+ 
+ 
++def _plan_status(result: dict) -> str:
++    if not result.get("guardrail_allowed", True):
++        return "blocked"
++    return "draft" if result.get("requires_approval") else "final"
++
++
+ @app.post("/api/travel")
+-async def travel_planner(request_data: TravelRequest):
++async def travel_planner(request_data: TravelRequest, request: Request):
+     try:
+         user_message = request_data.message.strip()
+ 
+@@ -85,6 +92,12 @@ async def travel_planner(request_data: TravelRequest):
+             thread_id=request_data.thread_id,
+         )
+ 
++        # Signed-in users get the plan saved to "My trips".
++        user = accounts.current_user(request)
++        if user:
++            accounts.save_plan(user["user_id"], result["thread_id"], user_message,
++                               _plan_status(result))
++
+         return JSONResponse(
+             content={
+                 "success": True,
+@@ -122,6 +135,7 @@ async def approve_travel_plan(request_data: ApprovalRequest):
+             approved=request_data.approved,
+             feedback=request_data.feedback,
+         )
++        accounts.update_plan_status(request_data.thread_id, _plan_status(result))
+ 
+         return JSONResponse(
+             content={
+@@ -170,6 +184,7 @@ async def favicon():
+ # members can still load the page and see live status.
+ # =====================================================================
+ store.setup()
++accounts.setup()
+ 
+ FoodPref = Literal["no_preference", "vegetarian", "jain", "vegan", "non_vegetarian"]
+ STALE_AFTER = timedelta(minutes=15)
+@@ -229,7 +244,7 @@ def _member_for_plan(m: dict) -> dict:
+     return {k: m.get(k) for k in store.MEMBER_FIELDS}
+ 
+ 
+-def _trip_view(trip_id: str, member_id: str | None) -> JSONResponse:
++def _trip_view(trip_id: str, member_id: str | None, user: dict | None = None) -> JSONResponse:
+     trip = store.get_trip(trip_id)
+     if trip is None:
+         return _error("Trip not found.", 404)
+@@ -237,6 +252,17 @@ def _trip_view(trip_id: str, member_id: str | None) -> JSONResponse:
+     members = store.get_members(trip_id)
+     me = next((m for m in members if m["member_id"] == member_id), None)
+ 
++    if user:
++        # A signed-in member is recognised on any device, even without the
++        # member key this browser saved when they joined.
++        mine = next((m for m in members if m.get("clerk_user_id") == user["user_id"]), None)
++        if mine:
++            me = mine
++        elif me and not me.get("clerk_user_id") and accounts.link_member(
++                trip_id, me["member_id"], user["user_id"]):
++            # Joined as a guest earlier on this browser: save it to the account.
++            me["clerk_user_id"] = user["user_id"]
++
+     if me is None:
+         # Not a member yet: show only what's needed to decide to join.
+         return JSONResponse(content={
+@@ -278,6 +304,7 @@ def _trip_view(trip_id: str, member_id: str | None) -> JSONResponse:
+             "can_edit": trip["status"] in store.EDITABLE_STATUSES,
+         },
+         "you": {
++            "member_id": me["member_id"],  # this person's own key
+             "name": me["name"],
+             "is_organiser": me["is_organiser"],
+             "details": _member_for_plan(me),
+@@ -293,20 +320,24 @@ def _trip_view(trip_id: str, member_id: str | None) -> JSONResponse:
+ 
+ @app.get("/group", response_class=HTMLResponse)
+ def group_home(request: Request):
+-    return templates.TemplateResponse(request=request, name="group.html", context={})
++    return templates.TemplateResponse(request=request, name="group.html",
++                                      context=accounts.template_context())
+ 
+ 
+ @app.get("/trip/{trip_id}", response_class=HTMLResponse)
+ def group_trip_page(request: Request, trip_id: str):
+-    return templates.TemplateResponse(request=request, name="group.html", context={})
++    return templates.TemplateResponse(request=request, name="group.html",
++                                      context=accounts.template_context())
+ 
+ 
+ @app.post("/api/trips")
+-def create_group_trip(data: TripCreate):
++def create_group_trip(data: TripCreate, request: Request):
++    user = accounts.current_user(request)
+     try:
+         trip_id, member_id = store.create_trip(
+             data.title, data.description, data.trip_days,
+             data.approval_rule, data.organiser.model_dump(),
++            user_id=user["user_id"] if user else None,
+         )
+     except store.TripError as exc:
+         return _error(str(exc), exc.status_code)
+@@ -315,7 +346,7 @@ def create_group_trip(data: TripCreate):
+ 
+ 
+ @app.post("/api/trips/{trip_id}/members")
+-def join_or_update_member(trip_id: str, data: JoinRequest):
++def join_or_update_member(trip_id: str, data: JoinRequest, request: Request):
+     details = data.model_dump(exclude={"member_id"})
+     try:
+         if data.member_id:
+@@ -324,19 +355,21 @@ def join_or_update_member(trip_id: str, data: JoinRequest):
+         else:
+             if store.get_trip(trip_id) is None:
+                 return _error("Trip not found.", 404)
+-            member_id = store.add_member(trip_id, details)
++            user = accounts.current_user(request)
++            member_id = store.add_member(trip_id, details,
++                                         user_id=user["user_id"] if user else None)
+     except store.TripError as exc:
+         return _error(str(exc), exc.status_code)
+     return {"success": True, "member_id": member_id}
+ 
+ 
+ @app.get("/api/trips/{trip_id}")
+-def get_group_trip(trip_id: str, member_id: str | None = None):
+-    return _trip_view(trip_id, member_id)
++def get_group_trip(trip_id: str, request: Request, member_id: str | None = None):
++    return _trip_view(trip_id, member_id, accounts.current_user(request))
+ 
+ 
+ @app.post("/api/trips/{trip_id}/plan")
+-def plan_group_trip(trip_id: str, data: PlanRequest):
++def plan_group_trip(trip_id: str, data: PlanRequest, request: Request):
+     try:
+         trip = store.claim_planning(trip_id, data.member_id)
+     except store.TripError as exc:
+@@ -365,11 +398,11 @@ def plan_group_trip(trip_id: str, data: PlanRequest):
+         store.set_status(trip_id, store.NEEDS_CHANGES)
+     else:
+         store.set_status(trip_id, store.COMPLETED)
+-    return _trip_view(trip_id, data.member_id)
++    return _trip_view(trip_id, data.member_id, accounts.current_user(request))
+ 
+ 
+ @app.post("/api/trips/{trip_id}/vote")
+-def vote_on_group_trip(trip_id: str, data: VoteRequest):
++def vote_on_group_trip(trip_id: str, data: VoteRequest, request: Request):
+     try:
+         outcome = store.record_vote(trip_id, data.member_id, data.decision, data.feedback)
+     except store.TripError as exc:
+@@ -395,7 +428,49 @@ def vote_on_group_trip(trip_id: str, data: VoteRequest):
+         else:
+             store.set_status(trip_id, store.COMPLETED)
+ 
+-    return _trip_view(trip_id, data.member_id)
++    return _trip_view(trip_id, data.member_id, accounts.current_user(request))
++
++
++# =====================================================================
++# Accounts (Clerk) and "My trips"
++#
++# Optional: guests can still use everything. Sign-in happens in the browser
++# through Clerk; each /api request carries Clerk's session token, which
++# accounts.current_user() checks. Trips and plans are saved in PostgreSQL
++# under the Clerk user ID so they can be reopened on any device.
++# =====================================================================
++@app.get("/login", response_class=HTMLResponse)
++def login_page(request: Request):
++    return templates.TemplateResponse(request=request, name="login.html",
++                                      context=accounts.template_context())
++
++
++@app.get("/my-trips", response_class=HTMLResponse)
++def my_trips_page(request: Request):
++    return templates.TemplateResponse(request=request, name="my_trips.html",
++                                      context=accounts.template_context())
++
++
++@app.get("/api/me/trips")
++def list_my_trips(request: Request):
++    user = accounts.current_user(request)
++    if not user:
++        return _error("Log in to see your trips.", 401)
++    return {"success": True, **accounts.my_trips(user["user_id"])}
++
++
++@app.get("/api/me/plans/{thread_id}")
++def open_saved_plan(thread_id: str, request: Request):
++    user = accounts.current_user(request)
++    if not user:
++        return _error("Log in to open your saved plans.", 401)
++    saved = accounts.get_saved_plan(user["user_id"], thread_id)
++    if saved is None:
++        return _error("Plan not found in your account.", 404)
++    plan = get_group_plan(thread_id)  # reads the saved LangGraph state, runs nothing
++    if plan is None:
++        return _error("This plan's details are no longer available.", 404)
++    return {"success": True, "title": saved["title"], "status": saved["status"], **plan}
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/group_store.py b/group_store.py
+index ada8f3b..28f61e5 100644
+--- a/group_store.py
++++ b/group_store.py
+@@ -161,18 +161,22 @@ def _member_values(data: dict[str, Any]) -> dict[str, Any]:
+     return values
+ 
+ 
+-def _insert_member(conn, trip_id: str, values: dict[str, Any], is_organiser: bool) -> str:
++def _insert_member(conn, trip_id: str, values: dict[str, Any], is_organiser: bool,
++                   user_id: str | None = None) -> str:
++    """user_id is the signed-in Clerk user's ID (None for guests).
++    The clerk_user_id column is added by accounts.setup()."""
+     member_id = secrets.token_urlsafe(16)
+     try:
+         conn.execute(
+             """
+             INSERT INTO trip_members (member_id, trip_id, is_organiser, name, origin,
+-                budget_max, available_from, available_to, food_pref, must_see, notes)
++                budget_max, available_from, available_to, food_pref, must_see, notes, clerk_user_id)
+             VALUES (%(member_id)s, %(trip_id)s, %(is_organiser)s, %(name)s, %(origin)s,
+                 %(budget_max)s, %(available_from)s, %(available_to)s, %(food_pref)s,
+-                %(must_see)s, %(notes)s)
++                %(must_see)s, %(notes)s, %(user_id)s)
+             """,
+-            {**values, "member_id": member_id, "trip_id": trip_id, "is_organiser": is_organiser},
++            {**values, "member_id": member_id, "trip_id": trip_id,
++             "is_organiser": is_organiser, "user_id": user_id},
+         )
+     except psycopg.errors.UniqueViolation:
+         raise TripError(f"Someone called {values['name']} has already joined this trip. Use a different name.")
+@@ -183,7 +187,8 @@ def _insert_member(conn, trip_id: str, values: dict[str, Any], is_organiser: boo
+ # Trips and members
+ # ---------------------------------------------------------------------
+ def create_trip(title: str, description: str, trip_days: int | None,
+-                approval_rule: str, organiser: dict[str, Any]) -> tuple[str, str]:
++                approval_rule: str, organiser: dict[str, Any],
++                user_id: str | None = None) -> tuple[str, str]:
+     title, description = (title or "").strip(), (description or "").strip()
+     if not title or not description:
+         raise TripError("Give the trip a title and a description.")
+@@ -199,7 +204,7 @@ def create_trip(title: str, description: str, trip_days: int | None,
+             """,
+             (trip_id, title, description, trip_days, approval_rule),
+         )
+-        member_id = _insert_member(conn, trip_id, values, is_organiser=True)
++        member_id = _insert_member(conn, trip_id, values, is_organiser=True, user_id=user_id)
+     return trip_id, member_id
+ 
+ 
+@@ -238,13 +243,18 @@ def _lock_trip(conn, trip_id: str) -> dict[str, Any]:
+     return trip
+ 
+ 
+-def add_member(trip_id: str, data: dict[str, Any]) -> str:
++def add_member(trip_id: str, data: dict[str, Any], user_id: str | None = None) -> str:
+     values = _member_values(data)
+     with pool().connection() as conn:
+         trip = _lock_trip(conn, trip_id)
++        if user_id and conn.execute(
++            "SELECT 1 FROM trip_members WHERE trip_id = %s AND clerk_user_id = %s",
++            (trip_id, user_id),
++        ).fetchone():
++            raise TripError("Your account has already joined this trip.", 409)
+         if trip["status"] not in EDITABLE_STATUSES:
+             raise TripError("Planning has already started, so new members can't join this trip.", 409)
+-        return _insert_member(conn, trip_id, values, is_organiser=False)
++        return _insert_member(conn, trip_id, values, is_organiser=False, user_id=user_id)
+ 
+ 
+ def update_member(trip_id: str, member_id: str, data: dict[str, Any]) -> None:
+diff --git a/requirements.txt b/requirements.txt
+index 7370bbb..53d633c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,6 +5,7 @@ langchain-community==0.4.2
+ langchain-tavily==0.2.18
+ psycopg[binary]==3.3.4
+ psycopg_pool==3.3.1
++PyJWT[crypto]>=2.10.1
+ python-dotenv==1.2.2
+ tavily-python==0.7.24
+ requests==2.34.2
+diff --git a/static/account.css b/static/account.css
+new file mode 100644
+index 0000000..ff1ff02
+--- /dev/null
++++ b/static/account.css
+@@ -0,0 +1,187 @@
++/* Accounts: shared account bar, login page and "My trips". Builds on style.css. */
++
++.account-bar {
++  display: flex;
++  justify-content: flex-end;
++  align-items: center;
++  flex-wrap: wrap;
++  gap: 10px;
++  min-height: 40px;
++  margin: -32px 0 22px;
++}
++
++.account-btn {
++  display: inline-flex;
++  align-items: center;
++  border: 1px solid transparent;
++  border-radius: 999px;
++  padding: 8px 16px;
++  background: linear-gradient(135deg, #2563eb, #7c3aed);
++  color: #ffffff;
++  font: inherit;
++  font-weight: 750;
++  font-size: 0.9rem;
++  text-decoration: none;
++  cursor: pointer;
++  transition: 0.2s ease;
++}
++
++.account-btn.ghost {
++  background: rgba(15, 23, 42, 0.72);
++  border-color: rgba(148, 163, 184, 0.35);
++  color: #e2e8f0;
++}
++
++.account-btn:hover {
++  transform: translateY(-1px);
++}
++
++.account-btn.ghost:hover {
++  border-color: rgba(96, 165, 250, 0.6);
++}
++
++.account-btn:disabled {
++  opacity: 0.6;
++  cursor: wait;
++}
++
++.account-name {
++  max-width: 160px;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  color: #e2e8f0;
++  font-weight: 700;
++  font-size: 0.92rem;
++}
++
++.account-menu {
++  display: inline-flex;
++  align-items: center;
++  min-width: 32px;
++  min-height: 32px;
++}
++
++/* Login / sign-up card */
++.auth-card {
++  max-width: 460px;
++  margin: 0 auto;
++}
++
++.auth-card .form-grid {
++  grid-template-columns: 1fr;
++}
++
++.auth-card .primary-btn {
++  width: 100%;
++}
++
++.form-actions.stacked {
++  flex-direction: column;
++}
++
++.form-actions.stacked > a {
++  display: flex;
++  justify-content: center;
++  width: 100%;
++  padding-top: 12px;
++  padding-bottom: 12px;
++  font-size: 1rem;
++  text-decoration: none;
++}
++
++.auth-status {
++  color: #cbd5e1;
++  line-height: 1.6;
++  text-align: center;
++}
++
++.clerk-mount {
++  display: flex;
++  justify-content: center;
++}
++
++.clerk-mount:empty {
++  display: none;
++}
++
++.auth-foot {
++  margin-top: 18px;
++  text-align: center;
++  color: #94a3b8;
++  font-size: 0.92rem;
++}
++
++.auth-foot a {
++  color: #93c5fd;
++}
++
++/* My trips */
++.trip-list {
++  display: grid;
++  gap: 12px;
++}
++
++.trip-row {
++  display: grid;
++  grid-template-columns: 1fr auto;
++  gap: 6px 16px;
++  align-items: center;
++  padding: 16px 18px;
++  border-radius: 18px;
++  border: 1px solid rgba(148, 163, 184, 0.22);
++  background: rgba(2, 6, 23, 0.45);
++  color: inherit;
++  text-decoration: none;
++  transition: 0.2s ease;
++}
++
++.trip-row:hover {
++  border-color: rgba(96, 165, 250, 0.6);
++  background: rgba(15, 23, 42, 0.8);
++}
++
++.trip-row h3 {
++  font-size: 1.05rem;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.trip-row .trip-meta {
++  grid-column: 1 / -1;
++  color: #94a3b8;
++  font-size: 0.88rem;
++}
++
++.empty-state {
++  padding: 18px;
++  border-radius: 18px;
++  border: 1px dashed rgba(148, 163, 184, 0.35);
++  color: #94a3b8;
++  line-height: 1.6;
++}
++
++.empty-state a {
++  color: #93c5fd;
++  font-weight: 700;
++}
++
++.planner-card + .planner-card {
++  margin-top: 26px;
++}
++
++@media (max-width: 760px) {
++  .account-bar {
++    margin-top: -14px;
++    justify-content: center;
++  }
++
++  .account-name {
++    max-width: 110px;
++  }
++
++  .trip-row {
++    grid-template-columns: 1fr;
++  }
++}
+diff --git a/static/account.js b/static/account.js
+new file mode 100644
+index 0000000..52c4741
+--- /dev/null
++++ b/static/account.js
+@@ -0,0 +1,123 @@
++// Accounts in the browser, powered by Clerk. Loaded on every page via templates/_clerk.html.
++//
++// - Loads Clerk (if CLERK_PUBLISHABLE_KEY is set) and draws the account bar:
++//   "Log in / Sign up" for guests, "My trips" + Clerk's account menu when signed in.
++// - Adds the signed-in user's Clerk session token to every /api request
++//   ("Authorization: Bearer ..."), so the server knows whose trips to save.
++// - If Clerk isn't set up or can't be reached (no internet), everything keeps
++//   working in guest mode.
++//
++// Other scripts can use:
++//   await window.TripBuddyAccount.ready   -> { id, name, email } or null for guests
++//   await window.TripBuddyAccount.clerk   -> the loaded Clerk object, or null
++
++(function () {
++  const config = window.TRIPBUDDY_CLERK || null;
++  const LOAD_TIMEOUT_MS = 10000;
++  const nativeFetch = window.fetch.bind(window);
++
++  function pageLoaded() {
++    if (document.readyState === "complete") return Promise.resolve();
++    return new Promise((resolve) => window.addEventListener("load", resolve, { once: true }));
++  }
++
++  function withTimeout(promise, ms) {
++    return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(null), ms))]);
++  }
++
++  async function loadClerk() {
++    if (!config) return null;
++    await pageLoaded(); // Clerk's scripts are deferred; they're ready once the page has loaded
++    if (!window.Clerk) {
++      console.warn("TripBuddy: couldn't load Clerk (offline?). Continuing in guest mode.");
++      return null;
++    }
++    try {
++      await window.Clerk.load({
++        ui: { ClerkUI: window.__internal_ClerkUICtor },
++        signInUrl: "/login",
++        signUpUrl: "/login?mode=signup",
++        afterSignOutUrl: "/",
++      });
++      return window.Clerk;
++    } catch (error) {
++      console.warn("TripBuddy: Clerk failed to start. Continuing in guest mode.", error);
++      return null;
++    }
++  }
++
++  function toUser(clerkUser) {
++    const email = clerkUser.primaryEmailAddress ? clerkUser.primaryEmailAddress.emailAddress : "";
++    return {
++      id: clerkUser.id,
++      name: clerkUser.fullName || clerkUser.firstName || clerkUser.username || email.split("@")[0] || "Traveller",
++      email,
++    };
++  }
++
++  const clerkReady = withTimeout(loadClerk(), LOAD_TIMEOUT_MS);
++  const ready = clerkReady.then((clerk) => (clerk && clerk.isSignedIn && clerk.user ? toUser(clerk.user) : null));
++  window.TripBuddyAccount = { enabled: Boolean(config), clerk: clerkReady, ready };
++
++  // Attach the session token to TripBuddy's own API calls.
++  window.fetch = async function (input, init) {
++    if (typeof input === "string" && input.startsWith("/api/")) {
++      const clerk = await clerkReady;
++      if (clerk && clerk.session) {
++        try {
++          const token = await clerk.session.getToken();
++          if (token) {
++            const headers = new Headers((init && init.headers) || {});
++            headers.set("Authorization", `Bearer ${token}`);
++            init = { ...(init || {}), headers };
++          }
++        } catch (error) {
++          console.warn("TripBuddy: couldn't get a session token; sending as a guest.", error);
++        }
++      }
++    }
++    return nativeFetch(input, init);
++  };
++
++  function link(href, text, className) {
++    const a = document.createElement("a");
++    a.href = href;
++    a.textContent = text;
++    a.className = className;
++    return a;
++  }
++
++  async function renderBar() {
++    const bar = document.getElementById("accountBar");
++    if (!bar || !config) return;
++    const clerk = await clerkReady;
++    const user = await ready;
++    bar.replaceChildren();
++    if (!clerk) return; // Clerk unreachable: stay quiet, guest mode still works
++
++    if (!user) {
++      const next = encodeURIComponent(window.location.pathname + window.location.search);
++      bar.append(
++        link(`/login?next=${next}`, "Log in", "account-btn ghost"),
++        link(`/login?mode=signup&next=${next}`, "Sign up", "account-btn")
++      );
++      return;
++    }
++
++    const onMyTrips = window.location.pathname === "/my-trips";
++    const name = document.createElement("span");
++    name.className = "account-name";
++    name.textContent = user.name;
++    const menu = document.createElement("span");
++    menu.className = "account-menu";
++    bar.append(
++      onMyTrips ? link("/", "Plan a trip", "account-btn ghost") : link("/my-trips", "My trips", "account-btn ghost"),
++      name,
++      menu
++    );
++    // Clerk's own account menu: manage account, Google link, password, sign out
++    clerk.mountUserButton(menu);
++  }
++
++  renderBar();
++})();
+diff --git a/static/group.js b/static/group.js
+index b0ee79b..a38c4ff 100644
+--- a/static/group.js
++++ b/static/group.js
+@@ -430,6 +430,12 @@ async function loadTrip({ silent = false } = {}) {
+   try {
+     const view = await api("GET", `/api/trips/${app.tripId}${query}`);
+     app.view = view;
++    if (view.you && view.you.member_id && view.you.member_id !== app.memberId) {
++      // Recognised through the signed-in account (e.g. on a new device):
++      // keep the member key so voting and editing work from this browser.
++      app.memberId = view.you.member_id;
++      storageSet(memberKey(app.tripId), app.memberId);
++    }
+     if (!view.you) {
+       if (app.memberId) {
+         // Saved key no longer matches (e.g. database was reset)
+@@ -560,8 +566,19 @@ function downloadPdf() {
+ }
+ 
+ // ---------- start ----------
++function prefillNameFromAccount() {
++  if (!window.TripBuddyAccount) return;
++  window.TripBuddyAccount.ready.then((user) => {
++    if (!user) return;
++    document.querySelectorAll('#createForm [name="name"], #joinForm [name="name"]').forEach((input) => {
++      if (!input.value) input.value = user.name;
++    });
++  });
++}
++
+ function start() {
+   mountMemberFields();
++  prefillNameFromAccount();
+   $("createForm").addEventListener("submit", onCreate);
+   $("joinForm").addEventListener("submit", onJoin);
+   $("editForm").addEventListener("submit", onEditSave);
+diff --git a/static/login.js b/static/login.js
+new file mode 100644
+index 0000000..0792678
+--- /dev/null
++++ b/static/login.js
+@@ -0,0 +1,68 @@
++// Log-in / sign-up page. Clerk draws the forms (email + password, Google,
++// email verification codes and "Forgot password?").
++// /login?mode=signup shows sign-up; ?next=/some/page returns there afterwards.
++
++const params = new URLSearchParams(window.location.search);
++
++function safeNext() {
++  const next = params.get("next") || "";
++  // Only same-site paths, never another website.
++  return next.startsWith("/") && !next.startsWith("//") && !next.startsWith("/login")
++    ? next
++    : "/my-trips";
++}
++
++function setStatus(text) {
++  const box = document.getElementById("authStatus");
++  box.textContent = text;
++  box.classList.toggle("hidden", !text);
++}
++
++async function start() {
++  const account = window.TripBuddyAccount;
++  if (!account.enabled) {
++    setStatus("Accounts aren't set up yet. Add CLERK_PUBLISHABLE_KEY to .env and restart the app. " +
++      "You can still plan as a guest.");
++    return;
++  }
++
++  const clerk = await account.clerk;
++  if (!clerk) {
++    setStatus("Couldn't reach the sign-in service. Check your internet connection. " +
++      "You can still plan as a guest.");
++    return;
++  }
++
++  const next = safeNext();
++  if (clerk.isSignedIn) {
++    window.location.replace(next);
++    return;
++  }
++
++  const signup = params.get("mode") === "signup";
++  const nextParam = encodeURIComponent(next);
++  document.getElementById("authTitle").textContent = signup ? "Create your account" : "Welcome back";
++  setStatus("");
++
++  const mount = document.getElementById("clerkMount");
++  if (signup) {
++    clerk.mountSignUp(mount, {
++      fallbackRedirectUrl: next,
++      signInUrl: `/login?next=${nextParam}`,
++      signInFallbackRedirectUrl: next,
++    });
++  } else {
++    clerk.mountSignIn(mount, {
++      fallbackRedirectUrl: next,
++      signUpUrl: `/login?mode=signup&next=${nextParam}`,
++      signUpFallbackRedirectUrl: next,
++    });
++  }
++
++  // Backup for the redirect: as soon as someone is signed in, go on.
++  clerk.addListener(({ user }) => {
++    if (user) window.location.replace(next);
++  });
++}
++
++start();
+diff --git a/static/my_trips.js b/static/my_trips.js
+new file mode 100644
+index 0000000..0b6808f
+--- /dev/null
++++ b/static/my_trips.js
+@@ -0,0 +1,108 @@
++// "My trips": group trips and solo plans saved to the signed-in account.
++
++const $ = (id) => document.getElementById(id);
++
++const GROUP_STATUS = {
++  collecting: ["Collecting members", "wait"],
++  planning: ["Agents are planning", "busy"],
++  awaiting_votes: ["Waiting for votes", "wait"],
++  processing: ["Updating the plan", "busy"],
++  completed: ["Plan approved", "good"],
++  needs_changes: ["Needs changes", "bad"],
++  blocked: ["Blocked by guardrail", "bad"],
++};
++
++const SOLO_STATUS = {
++  draft: ["Draft · needs your approval", "wait"],
++  final: ["Final plan", "good"],
++  blocked: ["Blocked by guardrail", "bad"],
++};
++
++function el(tag, className, text) {
++  const node = document.createElement(tag);
++  if (className) node.className = className;
++  if (text !== undefined) node.textContent = text;
++  return node;
++}
++
++function niceDate(iso) {
++  return new Date(iso).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
++}
++
++function row(href, title, [label, tone], meta) {
++  const a = el("a", "trip-row");
++  a.href = href;
++  a.append(el("h3", "", title), el("span", `trip-status ${tone}`, label), el("p", "trip-meta", meta));
++  return a;
++}
++
++function empty(text, linkText, href) {
++  const box = el("div", "empty-state", text + " ");
++  const a = el("a", "", linkText);
++  a.href = href;
++  box.appendChild(a);
++  return box;
++}
++
++function render(data) {
++  const groups = $("groupList");
++  groups.replaceChildren();
++  if (!data.group_trips.length) {
++    groups.appendChild(empty("No group trips yet.", "Start one and share the link →", "/group"));
++  }
++  for (const t of data.group_trips) {
++    const role = t.is_organiser ? "Organiser" : "Member";
++    const people = `${t.members} ${t.members === 1 ? "person" : "people"}`;
++    const days = t.trip_days ? ` · ${t.trip_days} days` : "";
++    groups.appendChild(row(
++      `/trip/${encodeURIComponent(t.trip_id)}`,
++      t.title,
++      GROUP_STATUS[t.status] || [t.status, ""],
++      `${role} · ${people}${days} · updated ${niceDate(t.updated_at)}`
++    ));
++  }
++
++  const solo = $("soloList");
++  solo.replaceChildren();
++  if (!data.solo_plans.length) {
++    solo.appendChild(empty("No solo plans yet.", "Plan a trip →", "/"));
++  }
++  for (const p of data.solo_plans) {
++    solo.appendChild(row(
++      `/?plan=${encodeURIComponent(p.thread_id)}`,
++      p.title,
++      SOLO_STATUS[p.status] || [p.status, ""],
++      `Created ${niceDate(p.created_at)}`
++    ));
++  }
++
++  $("groupSection").classList.remove("hidden");
++  $("soloSection").classList.remove("hidden");
++}
++
++async function start() {
++  const account = window.TripBuddyAccount;
++  const user = await account.ready;
++  if (!user) {
++    $("loggedOut").classList.remove("hidden");
++    $("myTripsIntro").textContent = "Log in to see the trips and plans saved to your account.";
++    if (!account.enabled || !(await account.clerk)) {
++      $("loggedOutText").textContent = account.enabled
++        ? "Couldn't reach the sign-in service. Check your internet connection and reload."
++        : "Accounts aren't set up yet: add CLERK_PUBLISHABLE_KEY to .env and restart the app.";
++      $("loggedOutActions").classList.add("hidden");
++    }
++    return;
++  }
++  try {
++    const response = await fetch("/api/me/trips");
++    const data = await response.json();
++    if (!response.ok || !data.success) throw new Error(data.error || "Couldn't load your trips.");
++    render(data);
++  } catch (error) {
++    $("errorBox").textContent = error.message;
++    $("errorBox").classList.remove("hidden");
++  }
++}
++
++start();
+diff --git a/static/script.js b/static/script.js
+index f5fbb25..edb987c 100644
+--- a/static/script.js
++++ b/static/script.js
+@@ -1,4 +1,6 @@
+-let currentThreadId = localStorage.getItem("travel_thread_id") || null;
++// Each "Generate Draft" starts a new plan (its own thread), so every plan
++// is saved separately in "My trips" for signed-in users.
++let currentThreadId = null;
+ let latestAnswerMarkdown = "";
+ let waitingForApproval = false;
+ 
+@@ -92,6 +94,11 @@ function showResult(answer, threadId, isDraft = false) {
+ 
+   renderMarkdown(resultBox, latestAnswerMarkdown);
+   threadInfo.textContent = `Thread ID: ${threadId}`;
++  if (window.TripBuddyAccount) {
++    window.TripBuddyAccount.ready.then((user) => {
++      if (user) threadInfo.textContent = `Saved to My trips · Thread ID: ${threadId}`;
++    });
++  }
+   resultTitle.textContent = isDraft ? "Draft Travel Plan" : "Your Final AI Travel Plan";
+   resultSection.classList.remove("hidden");
+ 
+@@ -142,7 +149,7 @@ async function sendMessage() {
+       },
+       body: JSON.stringify({
+         message: message,
+-        thread_id: currentThreadId
++        thread_id: null
+       })
+     });
+ 
+@@ -153,7 +160,6 @@ async function sendMessage() {
+     }
+ 
+     currentThreadId = data.thread_id;
+-    localStorage.setItem("travel_thread_id", currentThreadId);
+ 
+     showWorkflow(data);
+ 
+@@ -292,6 +298,35 @@ function downloadPDF() {
+     });
+ }
+ 
++async function openSavedPlan(threadId) {
++  try {
++    const response = await fetch(`/api/me/plans/${encodeURIComponent(threadId)}`);
++    const data = await response.json();
++
++    if (!response.ok || !data.success) {
++      throw new Error(data.error || "Could not open this plan.");
++    }
++
++    currentThreadId = data.thread_id;
++    document.getElementById("userInput").value = data.title || "";
++    showWorkflow(data);
++
++    if (data.requires_approval) {
++      showResult(data.itinerary || data.answer, data.thread_id, true);
++      showApproval(data);
++    } else {
++      showResult(data.answer, data.thread_id, false);
++    }
++  } catch (error) {
++    showError(error.message);
++  }
++}
++
++const savedPlanId = new URLSearchParams(window.location.search).get("plan");
++if (savedPlanId) {
++  openSavedPlan(savedPlanId);
++}
++
+ document.addEventListener("keydown", function(event) {
+   if (event.ctrlKey && event.key === "Enter") {
+     sendMessage();
+diff --git a/templates/_clerk.html b/templates/_clerk.html
+new file mode 100644
+index 0000000..66a7e2f
+--- /dev/null
++++ b/templates/_clerk.html
+@@ -0,0 +1,13 @@
++{# Loads Clerk sign-in when CLERK_PUBLISHABLE_KEY is set in .env, then the account bar.
++   Without the key, TripBuddy runs in guest mode and no Clerk script is loaded. #}
++{% if clerk_publishable_key %}
++<script>window.TRIPBUDDY_CLERK = {{ {"publishableKey": clerk_publishable_key} | tojson }};</script>
++<script defer crossorigin="anonymous" type="text/javascript"
++  src="https://{{ clerk_frontend_api }}/npm/@clerk/ui@1/dist/ui.browser.js"></script>
++<script defer crossorigin="anonymous" type="text/javascript"
++  data-clerk-publishable-key="{{ clerk_publishable_key }}"
++  src="https://{{ clerk_frontend_api }}/npm/@clerk/clerk-js@6/dist/clerk.browser.js"></script>
++{% else %}
++<script>window.TRIPBUDDY_CLERK = null;</script>
++{% endif %}
++<script src="/static/account.js"></script>
+diff --git a/templates/group.html b/templates/group.html
+index 024d5be..b61f421 100644
+--- a/templates/group.html
++++ b/templates/group.html
+@@ -6,6 +6,7 @@
+   <title>TripBuddy Group Trip</title>
+   <link rel="stylesheet" href="/static/style.css">
+   <link rel="stylesheet" href="/static/group.css">
++  <link rel="stylesheet" href="/static/account.css">
+ </head>
+ <body>
+   <div class="page-bg">
+@@ -15,6 +16,8 @@
+   </div>
+ 
+   <main class="app-container">
++    <nav id="accountBar" class="account-bar" aria-label="Account"></nav>
++
+     <section class="hero-section compact">
+       <a class="badge" href="/">&larr; Solo planner</a>
+       <h1>Plan a trip together</h1>
+@@ -224,6 +227,7 @@
+ 
+   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
++  {% include "_clerk.html" %}
+   <script src="/static/group.js"></script>
+ </body>
+ </html>
+diff --git a/templates/index.html b/templates/index.html
+index 5802bbb..61f16fd 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -5,6 +5,7 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>TripBuddy AI</title>
+     <link rel="stylesheet" href="/static/style.css" />
++    <link rel="stylesheet" href="/static/account.css" />
+   </head>
+   <body>
+     <div class="page-bg">
+@@ -14,6 +15,8 @@
+     </div>
+ 
+     <main class="app-container">
++      <nav id="accountBar" class="account-bar" aria-label="Account"></nav>
++
+       <section class="hero-section">
+         <div class="badge">
+           ✈️ TripBuddy AI — LangGraph, MCP, Supervisor, Guardrails & HITL
+@@ -168,6 +171,7 @@
+ 
+     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
++    {% include "_clerk.html" %}
+     <script src="/static/script.js"></script>
+   </body>
+ </html>
+diff --git a/templates/login.html b/templates/login.html
+new file mode 100644
+index 0000000..5a185ee
+--- /dev/null
++++ b/templates/login.html
+@@ -0,0 +1,36 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>Log in · TripBuddy</title>
++  <link rel="stylesheet" href="/static/style.css">
++  <link rel="stylesheet" href="/static/group.css">
++  <link rel="stylesheet" href="/static/account.css">
++</head>
++<body>
++  <div class="page-bg">
++    <div class="gradient-circle circle-1"></div>
++    <div class="gradient-circle circle-2"></div>
++    <div class="gradient-circle circle-3"></div>
++  </div>
++
++  <main class="app-container">
++    <section class="hero-section compact">
++      <a class="badge" href="/">&larr; TripBuddy planner</a>
++      <h1 id="authTitle">Welcome back</h1>
++      <p>Your account keeps every solo plan and group trip in one place, on any device.</p>
++    </section>
++
++    <section id="authStatus" class="planner-card auth-card auth-status">Loading sign-in&hellip;</section>
++    <div id="clerkMount" class="clerk-mount"></div>
++
++    <p class="auth-foot">No account needed to plan &mdash; <a href="/">continue as a guest</a>.</p>
++  </main>
++
++  <footer>TripBuddy accounts &middot; sign-in by Clerk</footer>
++
++  {% include "_clerk.html" %}
++  <script src="/static/login.js"></script>
++</body>
++</html>
+diff --git a/templates/my_trips.html b/templates/my_trips.html
+new file mode 100644
+index 0000000..46812ae
+--- /dev/null
++++ b/templates/my_trips.html
+@@ -0,0 +1,72 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>My trips · TripBuddy</title>
++  <link rel="stylesheet" href="/static/style.css">
++  <link rel="stylesheet" href="/static/group.css">
++  <link rel="stylesheet" href="/static/account.css">
++</head>
++<body>
++  <div class="page-bg">
++    <div class="gradient-circle circle-1"></div>
++    <div class="gradient-circle circle-2"></div>
++    <div class="gradient-circle circle-3"></div>
++  </div>
++
++  <main class="app-container">
++    <nav id="accountBar" class="account-bar" aria-label="Account"></nav>
++
++    <section class="hero-section compact">
++      <a class="badge" href="/">&larr; Solo planner</a>
++      <h1>My trips</h1>
++      <p id="myTripsIntro">Every group trip you're part of and every solo plan you've made, saved to your account.</p>
++    </section>
++
++    <section id="loggedOut" class="planner-card auth-card hidden">
++      <div class="card-header">
++        <div>
++          <h2>Log in to see your trips</h2>
++          <p id="loggedOutText">Trips and plans are saved to your account, so you can open them on any device.</p>
++        </div>
++      </div>
++      <div id="loggedOutActions" class="form-actions stacked">
++        <a class="primary-btn" href="/login?next=/my-trips">Log in</a>
++        <a class="account-btn ghost" href="/login?mode=signup&amp;next=/my-trips">Create account</a>
++      </div>
++    </section>
++
++    <section id="groupSection" class="planner-card hidden">
++      <div class="card-header">
++        <div>
++          <span class="eyebrow">Group mode</span>
++          <h2>Group trips</h2>
++          <p>Trips you organised or joined.</p>
++        </div>
++        <a class="account-btn ghost" href="/group">+ New group trip</a>
++      </div>
++      <div id="groupList" class="trip-list"></div>
++    </section>
++
++    <section id="soloSection" class="planner-card hidden">
++      <div class="card-header">
++        <div>
++          <span class="eyebrow">Solo planner</span>
++          <h2>Solo plans</h2>
++          <p>Plans you made while logged in. Drafts can still be approved or revised.</p>
++        </div>
++        <a class="account-btn ghost" href="/">+ New plan</a>
++      </div>
++      <div id="soloList" class="trip-list"></div>
++    </section>
++
++    <section id="errorBox" class="error-box hidden" role="alert"></section>
++  </main>
++
++  <footer>TripBuddy &middot; your saved trips</footer>
++
++  {% include "_clerk.html" %}
++  <script src="/static/my_trips.js"></script>
++</body>
++</html>
+diff --git a/tests/test_accounts.py b/tests/test_accounts.py
+new file mode 100644
+index 0000000..5a9ba60
+--- /dev/null
++++ b/tests/test_accounts.py
+@@ -0,0 +1,194 @@
++"""
++Tests for Clerk accounts and "My trips": real PostgreSQL, fake AI model.
++
++Clerk itself isn't contacted. Instead the tests make their own RSA key pair,
++sign tokens shaped like Clerk session tokens with it, and give the server the
++public half as CLERK_JWT_KEY, exactly like Clerk's "JWKS Public Key" setting.
++
++Run with the same throwaway database as the group tests:
++    TEST_DATABASE_URL=postgresql://user:pass@localhost/tripbuddy_test?sslmode=disable \
++        python -m pytest tests/test_accounts.py -q
++"""
++
++import base64
++import os
++import sys
++import time
++import uuid
++
++import pytest
++
++TEST_DB = os.getenv("TEST_DATABASE_URL")
++pytestmark = pytest.mark.skipif(not TEST_DB, reason="set TEST_DATABASE_URL to run")
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++from test_group_api import create_trip, env, join, person  # noqa: E402,F401
++
++FAPI = "tripbuddy-test.clerk.accounts.dev"
++PUBLISHABLE_KEY = "pk_test_" + base64.b64encode(f"{FAPI}$".encode()).decode().rstrip("=")
++SITE = "http://testserver"  # the TestClient's origin
++
++
++def _key_pair():
++    from cryptography.hazmat.primitives import serialization
++    from cryptography.hazmat.primitives.asymmetric import rsa
++
++    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    public_pem = private.public_key().public_bytes(
++        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
++    ).decode()
++    return private, public_pem
++
++
++CLERK_PRIVATE_KEY, CLERK_PUBLIC_PEM = _key_pair()
++OTHER_PRIVATE_KEY, _ = _key_pair()
++
++
++@pytest.fixture(autouse=True)
++def clerk_settings(monkeypatch):
++    monkeypatch.setenv("CLERK_PUBLISHABLE_KEY", PUBLISHABLE_KEY)
++    monkeypatch.setenv("CLERK_JWT_KEY", CLERK_PUBLIC_PEM)
++    monkeypatch.delenv("CLERK_AUTHORIZED_PARTIES", raising=False)
++
++
++def clerk_token(user_id, key=None, azp=SITE, expires_in=300, algorithm="RS256"):
++    import jwt
++
++    now = int(time.time())
++    claims = {"sub": user_id, "sid": "sess_" + uuid.uuid4().hex[:8], "iat": now,
++              "nbf": now - 5, "exp": now + expires_in,
++              "iss": f"https://{FAPI}"}
++    if azp:
++        claims["azp"] = azp
++    return jwt.encode(claims, key or CLERK_PRIVATE_KEY, algorithm=algorithm)
++
++
++def device(user_id=None):
++    """A browser. With user_id it's signed in as that Clerk user."""
++    import app as app_module
++    from fastapi.testclient import TestClient
++
++    client = TestClient(app_module.app)
++    if user_id:
++        client.headers["Authorization"] = f"Bearer {clerk_token(user_id)}"
++    return client
++
++
++def new_user():
++    return "user_" + uuid.uuid4().hex[:12]
++
++
++def test_frontend_api_comes_from_the_publishable_key():
++    import accounts
++
++    assert accounts.frontend_api(PUBLISHABLE_KEY) == FAPI
++    assert accounts.frontend_api("pk_test_not-base64!!") is None
++    assert accounts.frontend_api("sk_test_abc") is None
++
++
++def test_pages_load_clerk_only_when_configured(env, monkeypatch):
++    page = device().get("/login").text
++    assert f"https://{FAPI}/npm/@clerk/clerk-js@6/dist/clerk.browser.js" in page
++    assert f'data-clerk-publishable-key="{PUBLISHABLE_KEY}"' in page
++    assert "/static/account.js" in device().get("/").text
++
++    monkeypatch.delenv("CLERK_PUBLISHABLE_KEY")
++    page = device().get("/").text
++    assert "clerk.browser.js" not in page and "window.TRIPBUDDY_CLERK = null" in page
++
++
++def test_only_genuine_clerk_tokens_for_this_site_are_accepted(env):
++    import jwt
++
++    user = new_user()
++    assert device(user).get("/api/me/trips").status_code == 200
++
++    def status_with(token):
++        return device().get("/api/me/trips", headers={"Authorization": f"Bearer {token}"}).status_code
++
++    assert status_with(clerk_token(user, expires_in=-60)) == 401          # expired
++    assert status_with(clerk_token(user, key=OTHER_PRIVATE_KEY)) == 401   # not signed by Clerk
++    assert status_with(clerk_token(user, azp="https://evil.example")) == 401  # made for another site
++    assert status_with(clerk_token(user, azp=None)) == 200                # no azp claim: allowed
++    forged = jwt.encode({"sub": user, "exp": int(time.time()) + 300},
++                        "an-attacker-guessed-hmac-secret-of-32-bytes", algorithm="HS256")
++    assert status_with(forged) == 401                                      # wrong algorithm
++    assert device().get("/api/me/trips").status_code == 401                # guest
++
++    # Clerk's __session cookie also works for same-site requests
++    browser = device()
++    browser.cookies.set("__session", clerk_token(user))
++    assert browser.get("/api/me/trips").status_code == 200
++
++
++def test_without_clerk_settings_everyone_is_a_guest(env, monkeypatch):
++    user = new_user()
++    token = clerk_token(user)
++    monkeypatch.delenv("CLERK_PUBLISHABLE_KEY")
++    monkeypatch.delenv("CLERK_JWT_KEY")
++    r = device().get("/api/me/trips", headers={"Authorization": f"Bearer {token}"})
++    assert r.status_code == 401
++
++
++def test_group_trips_saved_and_opened_on_another_device(env):
++    varun = new_user()
++    laptop = device(varun)
++    trip_id, member_id = create_trip(laptop)
++
++    join(device(), trip_id, person("Riya"))  # a friend joins as a guest
++
++    trips = laptop.get("/api/me/trips").json()["group_trips"]
++    assert [(t["trip_id"], t["is_organiser"], t["members"]) for t in trips] == [(trip_id, True, 2)]
++
++    phone = device(varun)  # same Clerk user, no member key saved on this device
++    view = phone.get(f"/api/trips/{trip_id}").json()
++    assert view["you"]["name"] == "Varun"
++    assert view["you"]["member_id"] == member_id
++
++    r = phone.post(f"/api/trips/{trip_id}/members", json=person("Varun again"))
++    assert r.status_code == 409
++
++
++def test_guest_membership_is_saved_after_signing_in(env):
++    trip_id, _ = create_trip(device(new_user()))
++
++    neha = new_user()
++    browser = device()
++    neha_key = join(browser, trip_id, person("Neha"))  # joined as a guest
++    browser.headers["Authorization"] = f"Bearer {clerk_token(neha)}"  # then signs in
++    assert browser.get("/api/me/trips").json()["group_trips"] == []
++
++    view = browser.get(f"/api/trips/{trip_id}", params={"member_id": neha_key}).json()
++    assert view["you"]["name"] == "Neha"
++    assert [t["trip_id"] for t in browser.get("/api/me/trips").json()["group_trips"]] == [trip_id]
++
++
++def test_solo_plans_saved_for_signed_in_users_only(env):
++    import psycopg
++
++    user = new_user()
++    client = device(user)
++    body = client.post("/api/travel", json={"message": "Plan 3 days in Goa from Mumbai"}).json()
++    assert body["requires_approval"]
++    plans = client.get("/api/me/trips").json()["solo_plans"]
++    assert [(p["thread_id"], p["status"], p["title"]) for p in plans] == [
++        (body["thread_id"], "draft", "Plan 3 days in Goa from Mumbai")]
++
++    client.post("/api/travel/approve",
++                json={"thread_id": body["thread_id"], "approved": True, "feedback": ""})
++    assert client.get("/api/me/trips").json()["solo_plans"][0]["status"] == "final"
++    opened = client.get(f"/api/me/plans/{body['thread_id']}").json()
++    assert opened["answer"] == "FINAL PLAN" and opened["requires_approval"] is False
++
++    # Stored in PostgreSQL under the Clerk user ID
++    with psycopg.connect(TEST_DB) as conn:
++        owner = conn.execute("SELECT clerk_user_id FROM solo_plans WHERE thread_id = %s",
++                             (body["thread_id"],)).fetchone()[0]
++    assert owner == user
++
++    assert device(new_user()).get(f"/api/me/plans/{body['thread_id']}").status_code == 404
++
++    guest = device()
++    assert guest.post("/api/travel", json={"message": "Plan 2 days in Udaipur"}).json()["success"]
++    assert guest.get("/api/me/trips").status_code == 401

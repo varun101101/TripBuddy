@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TripBuddy AI</title>
     <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/account.css" />
   </head>
   <body>
     <div class="page-bg">
@@ -14,6 +15,8 @@
     </div>
 
     <main class="app-container">
+      <nav id="accountBar" class="account-bar" aria-label="Account"></nav>
+
       <section class="hero-section">
         <div class="badge">
           ✈️ TripBuddy AI — LangGraph, MCP, Supervisor, Guardrails & HITL
@@ -168,6 +171,7 @@
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    {% include "_clerk.html" %}
     <script src="/static/script.js"></script>
   </body>
 </html>

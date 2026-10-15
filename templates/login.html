@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Log in · TripBuddy</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/group.css">
+  <link rel="stylesheet" href="/static/account.css">
+</head>
+<body>
+  <div class="page-bg">
+    <div class="gradient-circle circle-1"></div>
+    <div class="gradient-circle circle-2"></div>
+    <div class="gradient-circle circle-3"></div>
+  </div>
+
+  <main class="app-container">
+    <section class="hero-section compact">
+      <a class="badge" href="/">&larr; TripBuddy planner</a>
+      <h1 id="authTitle">Welcome back</h1>
+      <p>Your account keeps every solo plan and group trip in one place, on any device.</p>
+    </section>
+
+    <section id="authStatus" class="planner-card auth-card auth-status">Loading sign-in&hellip;</section>
+    <div id="clerkMount" class="clerk-mount"></div>
+
+    <p class="auth-foot">No account needed to plan &mdash; <a href="/">continue as a guest</a>.</p>
+  </main>
+
+  <footer>TripBuddy accounts &middot; sign-in by Clerk</footer>
+
+  {% include "_clerk.html" %}
+  <script src="/static/login.js"></script>
+</body>
+</html>

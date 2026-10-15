@@ -1,4 +1,6 @@
-let currentThreadId = localStorage.getItem("travel_thread_id") || null;
+// Each "Generate Draft" starts a new plan (its own thread), so every plan
+// is saved separately in "My trips" for signed-in users.
+let currentThreadId = null;
 let latestAnswerMarkdown = "";
 let waitingForApproval = false;
 
@@ -92,6 +94,11 @@ function showResult(answer, threadId, isDraft = false) {
 
   renderMarkdown(resultBox, latestAnswerMarkdown);
   threadInfo.textContent = `Thread ID: ${threadId}`;
+  if (window.TripBuddyAccount) {
+    window.TripBuddyAccount.ready.then((user) => {
+      if (user) threadInfo.textContent = `Saved to My trips · Thread ID: ${threadId}`;
+    });
+  }
   resultTitle.textContent = isDraft ? "Draft Travel Plan" : "Your Final AI Travel Plan";
   resultSection.classList.remove("hidden");
 
@@ -142,7 +149,7 @@ async function sendMessage() {
       },
       body: JSON.stringify({
         message: message,
-        thread_id: currentThreadId
+        thread_id: null
       })
     });
 
@@ -153,7 +160,6 @@ async function sendMessage() {
     }
 
     currentThreadId = data.thread_id;
-    localStorage.setItem("travel_thread_id", currentThreadId);
 
     showWorkflow(data);
 
@@ -290,6 +296,35 @@ function downloadPDF() {
       downloadBtn.disabled = false;
       showError("Could not download PDF.");
     });
+}
+
+async function openSavedPlan(threadId) {
+  try {
+    const response = await fetch(`/api/me/plans/${encodeURIComponent(threadId)}`);
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || "Could not open this plan.");
+    }
+
+    currentThreadId = data.thread_id;
+    document.getElementById("userInput").value = data.title || "";
+    showWorkflow(data);
+
+    if (data.requires_approval) {
+      showResult(data.itinerary || data.answer, data.thread_id, true);
+      showApproval(data);
+    } else {
+      showResult(data.answer, data.thread_id, false);
+    }
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+const savedPlanId = new URLSearchParams(window.location.search).get("plan");
+if (savedPlanId) {
+  openSavedPlan(savedPlanId);
 }
 
 document.addEventListener("keydown", function(event) {

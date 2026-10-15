@@ -430,6 +430,12 @@ async function loadTrip({ silent = false } = {}) {
   try {
     const view = await api("GET", `/api/trips/${app.tripId}${query}`);
     app.view = view;
+    if (view.you && view.you.member_id && view.you.member_id !== app.memberId) {
+      // Recognised through the signed-in account (e.g. on a new device):
+      // keep the member key so voting and editing work from this browser.
+      app.memberId = view.you.member_id;
+      storageSet(memberKey(app.tripId), app.memberId);
+    }
     if (!view.you) {
       if (app.memberId) {
         // Saved key no longer matches (e.g. database was reset)
@@ -560,8 +566,19 @@ function downloadPdf() {
 }
 
 // ---------- start ----------
+function prefillNameFromAccount() {
+  if (!window.TripBuddyAccount) return;
+  window.TripBuddyAccount.ready.then((user) => {
+    if (!user) return;
+    document.querySelectorAll('#createForm [name="name"], #joinForm [name="name"]').forEach((input) => {
+      if (!input.value) input.value = user.name;
+    });
+  });
+}
+
 function start() {
   mountMemberFields();
+  prefillNameFromAccount();
   $("createForm").addEventListener("submit", onCreate);
   $("joinForm").addEventListener("submit", onJoin);
   $("editForm").addEventListener("submit", onEditSave);

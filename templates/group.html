@@ -6,6 +6,7 @@
   <title>TripBuddy Group Trip</title>
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/group.css">
+  <link rel="stylesheet" href="/static/account.css">
 </head>
 <body>
   <div class="page-bg">
@@ -15,6 +16,8 @@
   </div>
 
   <main class="app-container">
+    <nav id="accountBar" class="account-bar" aria-label="Account"></nav>
+
     <section class="hero-section compact">
       <a class="badge" href="/">&larr; Solo planner</a>
       <h1>Plan a trip together</h1>
@@ -224,6 +227,7 @@
 
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  {% include "_clerk.html" %}
   <script src="/static/group.js"></script>
 </body>
 </html>

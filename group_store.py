@@ -161,18 +161,22 @@ def _member_values(data: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
-def _insert_member(conn, trip_id: str, values: dict[str, Any], is_organiser: bool) -> str:
+def _insert_member(conn, trip_id: str, values: dict[str, Any], is_organiser: bool,
+                   user_id: str | None = None) -> str:
+    """user_id is the signed-in Clerk user's ID (None for guests).
+    The clerk_user_id column is added by accounts.setup()."""
     member_id = secrets.token_urlsafe(16)
     try:
         conn.execute(
             """
             INSERT INTO trip_members (member_id, trip_id, is_organiser, name, origin,
-                budget_max, available_from, available_to, food_pref, must_see, notes)
+                budget_max, available_from, available_to, food_pref, must_see, notes, clerk_user_id)
             VALUES (%(member_id)s, %(trip_id)s, %(is_organiser)s, %(name)s, %(origin)s,
                 %(budget_max)s, %(available_from)s, %(available_to)s, %(food_pref)s,
-                %(must_see)s, %(notes)s)
+                %(must_see)s, %(notes)s, %(user_id)s)
             """,
-            {**values, "member_id": member_id, "trip_id": trip_id, "is_organiser": is_organiser},
+            {**values, "member_id": member_id, "trip_id": trip_id,
+             "is_organiser": is_organiser, "user_id": user_id},
         )
     except psycopg.errors.UniqueViolation:
         raise TripError(f"Someone called {values['name']} has already joined this trip. Use a different name.")
@@ -183,7 +187,8 @@ def _insert_member(conn, trip_id: str, values: dict[str, Any], is_organiser: boo
 # Trips and members
 # ---------------------------------------------------------------------
 def create_trip(title: str, description: str, trip_days: int | None,
-                approval_rule: str, organiser: dict[str, Any]) -> tuple[str, str]:
+                approval_rule: str, organiser: dict[str, Any],
+                user_id: str | None = None) -> tuple[str, str]:
     title, description = (title or "").strip(), (description or "").strip()
     if not title or not description:
         raise TripError("Give the trip a title and a description.")
@@ -199,7 +204,7 @@ def create_trip(title: str, description: str, trip_days: int | None,
             """,
             (trip_id, title, description, trip_days, approval_rule),
         )
-        member_id = _insert_member(conn, trip_id, values, is_organiser=True)
+        member_id = _insert_member(conn, trip_id, values, is_organiser=True, user_id=user_id)
     return trip_id, member_id
 
 
@@ -238,13 +243,18 @@ def _lock_trip(conn, trip_id: str) -> dict[str, Any]:
     return trip
 
 
-def add_member(trip_id: str, data: dict[str, Any]) -> str:
+def add_member(trip_id: str, data: dict[str, Any], user_id: str | None = None) -> str:
     values = _member_values(data)
     with pool().connection() as conn:
         trip = _lock_trip(conn, trip_id)
+        if user_id and conn.execute(
+            "SELECT 1 FROM trip_members WHERE trip_id = %s AND clerk_user_id = %s",
+            (trip_id, user_id),
+        ).fetchone():
+            raise TripError("Your account has already joined this trip.", 409)
         if trip["status"] not in EDITABLE_STATUSES:
             raise TripError("Planning has already started, so new members can't join this trip.", 409)
-        return _insert_member(conn, trip_id, values, is_organiser=False)
+        return _insert_member(conn, trip_id, values, is_organiser=False, user_id=user_id)
 
 
 def update_member(trip_id: str, member_id: str, data: dict[str, Any]) -> None:

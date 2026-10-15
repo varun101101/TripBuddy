@@ -1,0 +1,13 @@
+{# Loads Clerk sign-in when CLERK_PUBLISHABLE_KEY is set in .env, then the account bar.
+   Without the key, TripBuddy runs in guest mode and no Clerk script is loaded. #}
+{% if clerk_publishable_key %}
+<script>window.TRIPBUDDY_CLERK = {{ {"publishableKey": clerk_publishable_key} | tojson }};</script>
+<script defer crossorigin="anonymous" type="text/javascript"
+  src="https://{{ clerk_frontend_api }}/npm/@clerk/ui@1/dist/ui.browser.js"></script>
+<script defer crossorigin="anonymous" type="text/javascript"
+  data-clerk-publishable-key="{{ clerk_publishable_key }}"
+  src="https://{{ clerk_frontend_api }}/npm/@clerk/clerk-js@6/dist/clerk.browser.js"></script>
+{% else %}
+<script>window.TRIPBUDDY_CLERK = null;</script>
+{% endif %}
+<script src="/static/account.js"></script>

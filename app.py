@@ -17,6 +17,7 @@ from backend import (
     run_group_plan,
     run_travel_agent,
 )
+import accounts
 import group_store as store
 from group_logic import APPROVAL_RULES, FOOD_PREFERENCES, MAX_REVISION_ROUNDS, merge_members
 
@@ -62,12 +63,18 @@ async def home(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={},
+        context=accounts.template_context(),
     )
 
 
+def _plan_status(result: dict) -> str:
+    if not result.get("guardrail_allowed", True):
+        return "blocked"
+    return "draft" if result.get("requires_approval") else "final"
+
+
 @app.post("/api/travel")
-async def travel_planner(request_data: TravelRequest):
+async def travel_planner(request_data: TravelRequest, request: Request):
     try:
         user_message = request_data.message.strip()
 
@@ -84,6 +91,12 @@ async def travel_planner(request_data: TravelRequest):
             user_input=user_message,
             thread_id=request_data.thread_id,
         )
+
+        # Signed-in users get the plan saved to "My trips".
+        user = accounts.current_user(request)
+        if user:
+            accounts.save_plan(user["user_id"], result["thread_id"], user_message,
+                               _plan_status(result))
 
         return JSONResponse(
             content={
@@ -122,6 +135,7 @@ async def approve_travel_plan(request_data: ApprovalRequest):
             approved=request_data.approved,
             feedback=request_data.feedback,
         )
+        accounts.update_plan_status(request_data.thread_id, _plan_status(result))
 
         return JSONResponse(
             content={
@@ -170,6 +184,7 @@ async def favicon():
 # members can still load the page and see live status.
 # =====================================================================
 store.setup()
+accounts.setup()
 
 FoodPref = Literal["no_preference", "vegetarian", "jain", "vegan", "non_vegetarian"]
 STALE_AFTER = timedelta(minutes=15)
@@ -229,13 +244,24 @@ def _member_for_plan(m: dict) -> dict:
     return {k: m.get(k) for k in store.MEMBER_FIELDS}
 
 
-def _trip_view(trip_id: str, member_id: str | None) -> JSONResponse:
+def _trip_view(trip_id: str, member_id: str | None, user: dict | None = None) -> JSONResponse:
     trip = store.get_trip(trip_id)
     if trip is None:
         return _error("Trip not found.", 404)
     trip = _recover_if_stale(trip)
     members = store.get_members(trip_id)
     me = next((m for m in members if m["member_id"] == member_id), None)
+
+    if user:
+        # A signed-in member is recognised on any device, even without the
+        # member key this browser saved when they joined.
+        mine = next((m for m in members if m.get("clerk_user_id") == user["user_id"]), None)
+        if mine:
+            me = mine
+        elif me and not me.get("clerk_user_id") and accounts.link_member(
+                trip_id, me["member_id"], user["user_id"]):
+            # Joined as a guest earlier on this browser: save it to the account.
+            me["clerk_user_id"] = user["user_id"]
 
     if me is None:
         # Not a member yet: show only what's needed to decide to join.
@@ -278,6 +304,7 @@ def _trip_view(trip_id: str, member_id: str | None) -> JSONResponse:
             "can_edit": trip["status"] in store.EDITABLE_STATUSES,
         },
         "you": {
+            "member_id": me["member_id"],  # this person's own key
             "name": me["name"],
             "is_organiser": me["is_organiser"],
             "details": _member_for_plan(me),
@@ -293,20 +320,24 @@ def _trip_view(trip_id: str, member_id: str | None) -> JSONResponse:
 
 @app.get("/group", response_class=HTMLResponse)
 def group_home(request: Request):
-    return templates.TemplateResponse(request=request, name="group.html", context={})
+    return templates.TemplateResponse(request=request, name="group.html",
+                                      context=accounts.template_context())
 
 
 @app.get("/trip/{trip_id}", response_class=HTMLResponse)
 def group_trip_page(request: Request, trip_id: str):
-    return templates.TemplateResponse(request=request, name="group.html", context={})
+    return templates.TemplateResponse(request=request, name="group.html",
+                                      context=accounts.template_context())
 
 
 @app.post("/api/trips")
-def create_group_trip(data: TripCreate):
+def create_group_trip(data: TripCreate, request: Request):
+    user = accounts.current_user(request)
     try:
         trip_id, member_id = store.create_trip(
             data.title, data.description, data.trip_days,
             data.approval_rule, data.organiser.model_dump(),
+            user_id=user["user_id"] if user else None,
         )
     except store.TripError as exc:
         return _error(str(exc), exc.status_code)
@@ -315,7 +346,7 @@ def create_group_trip(data: TripCreate):
 
 
 @app.post("/api/trips/{trip_id}/members")
-def join_or_update_member(trip_id: str, data: JoinRequest):
+def join_or_update_member(trip_id: str, data: JoinRequest, request: Request):
     details = data.model_dump(exclude={"member_id"})
     try:
         if data.member_id:
@@ -324,19 +355,21 @@ def join_or_update_member(trip_id: str, data: JoinRequest):
         else:
             if store.get_trip(trip_id) is None:
                 return _error("Trip not found.", 404)
-            member_id = store.add_member(trip_id, details)
+            user = accounts.current_user(request)
+            member_id = store.add_member(trip_id, details,
+                                         user_id=user["user_id"] if user else None)
     except store.TripError as exc:
         return _error(str(exc), exc.status_code)
     return {"success": True, "member_id": member_id}
 
 
 @app.get("/api/trips/{trip_id}")
-def get_group_trip(trip_id: str, member_id: str | None = None):
-    return _trip_view(trip_id, member_id)
+def get_group_trip(trip_id: str, request: Request, member_id: str | None = None):
+    return _trip_view(trip_id, member_id, accounts.current_user(request))
 
 
 @app.post("/api/trips/{trip_id}/plan")
-def plan_group_trip(trip_id: str, data: PlanRequest):
+def plan_group_trip(trip_id: str, data: PlanRequest, request: Request):
     try:
         trip = store.claim_planning(trip_id, data.member_id)
     except store.TripError as exc:
@@ -365,11 +398,11 @@ def plan_group_trip(trip_id: str, data: PlanRequest):
         store.set_status(trip_id, store.NEEDS_CHANGES)
     else:
         store.set_status(trip_id, store.COMPLETED)
-    return _trip_view(trip_id, data.member_id)
+    return _trip_view(trip_id, data.member_id, accounts.current_user(request))
 
 
 @app.post("/api/trips/{trip_id}/vote")
-def vote_on_group_trip(trip_id: str, data: VoteRequest):
+def vote_on_group_trip(trip_id: str, data: VoteRequest, request: Request):
     try:
         outcome = store.record_vote(trip_id, data.member_id, data.decision, data.feedback)
     except store.TripError as exc:
@@ -395,7 +428,49 @@ def vote_on_group_trip(trip_id: str, data: VoteRequest):
         else:
             store.set_status(trip_id, store.COMPLETED)
 
-    return _trip_view(trip_id, data.member_id)
+    return _trip_view(trip_id, data.member_id, accounts.current_user(request))
+
+
+# =====================================================================
+# Accounts (Clerk) and "My trips"
+#
+# Optional: guests can still use everything. Sign-in happens in the browser
+# through Clerk; each /api request carries Clerk's session token, which
+# accounts.current_user() checks. Trips and plans are saved in PostgreSQL
+# under the Clerk user ID so they can be reopened on any device.
+# =====================================================================
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    return templates.TemplateResponse(request=request, name="login.html",
+                                      context=accounts.template_context())
+
+
+@app.get("/my-trips", response_class=HTMLResponse)
+def my_trips_page(request: Request):
+    return templates.TemplateResponse(request=request, name="my_trips.html",
+                                      context=accounts.template_context())
+
+
+@app.get("/api/me/trips")
+def list_my_trips(request: Request):
+    user = accounts.current_user(request)
+    if not user:
+        return _error("Log in to see your trips.", 401)
+    return {"success": True, **accounts.my_trips(user["user_id"])}
+
+
+@app.get("/api/me/plans/{thread_id}")
+def open_saved_plan(thread_id: str, request: Request):
+    user = accounts.current_user(request)
+    if not user:
+        return _error("Log in to open your saved plans.", 401)
+    saved = accounts.get_saved_plan(user["user_id"], thread_id)
+    if saved is None:
+        return _error("Plan not found in your account.", 404)
+    plan = get_group_plan(thread_id)  # reads the saved LangGraph state, runs nothing
+    if plan is None:
+        return _error("This plan's details are no longer available.", 404)
+    return {"success": True, "title": saved["title"], "status": saved["status"], **plan}
 
 
 if __name__ == "__main__":

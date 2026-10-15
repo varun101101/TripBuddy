@@ -14,6 +14,211 @@
 //      "Page X of Y" footers.
 
 (function () {
+  // The PDF styles live here, not in style.css, so they can never be out of step
+  // with this script (a cached old style.css once left the PDF text white on white).
+  const PDF_CSS = `
+    .pdf-host {
+      position: fixed;
+      left: -10000px;
+      top: 0;
+      z-index: -1;
+    }
+
+    .pdf-sheet {
+      background: #ffffff;
+      color: #1f2937;
+      font-family: Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
+      font-size: 12.5px;
+      line-height: 1.55;
+      /* A tiny letter-spacing makes html2canvas place every character exactly where the
+         browser laid it out; without it, wrapped text near quotes and brackets can overprint. */
+      letter-spacing: 0.01px;
+    }
+
+    /* Headings often start with emoji like 1️⃣, which per-character placement would break,
+       and they rarely wrap, so they keep normal spacing. */
+    .pdf-header,
+    .pdf-body h1,
+    .pdf-body h2,
+    .pdf-body h3,
+    .pdf-body h4 {
+      letter-spacing: normal;
+    }
+
+    .pdf-header {
+      padding-bottom: 10px;
+      margin-bottom: 14px;
+      border-bottom: 2px solid #2563eb;
+    }
+
+    .pdf-brand {
+      color: #2563eb;
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .pdf-doc-title {
+      margin-top: 2px;
+      color: #0f172a;
+      font-size: 22px;
+      line-height: 1.25;
+    }
+
+    .pdf-doc-subtitle {
+      margin-top: 3px;
+      color: #64748b;
+      font-size: 10.5px;
+    }
+
+    .pdf-body > :first-child {
+      margin-top: 0;
+    }
+
+    .pdf-body h1,
+    .pdf-body h2,
+    .pdf-body h3,
+    .pdf-body h4 {
+      color: #0f172a;
+      line-height: 1.3;
+    }
+
+    .pdf-body h1 {
+      margin: 16px 0 8px;
+      font-size: 17px;
+    }
+
+    .pdf-body h2 {
+      margin: 18px 0 8px;
+      padding: 6px 10px;
+      border-left: 4px solid #2563eb;
+      border-radius: 4px;
+      background: #eff6ff;
+      font-size: 15px;
+    }
+
+    .pdf-body h3 {
+      margin: 14px 0 6px;
+      color: #1d4ed8;
+      font-size: 13.5px;
+    }
+
+    .pdf-body h4 {
+      margin: 12px 0 4px;
+      font-size: 11.5px;
+    }
+
+    .pdf-body p {
+      margin: 0 0 8px;
+    }
+
+    .pdf-body ul,
+    .pdf-body ol {
+      margin: 4px 0 10px 4px;
+      list-style: none; /* markers are added as text by pdf_export.js */
+    }
+
+    .pdf-body li {
+      position: relative;
+      margin-bottom: 3px;
+      padding-left: 16px;
+    }
+
+    .pdf-body ol > li {
+      padding-left: 22px;
+    }
+
+    .pdf-body li.pdf-task {
+      padding-left: 2px;
+    }
+
+    .pdf-body li.pdf-task input {
+      margin-right: 6px;
+      vertical-align: -1px;
+    }
+
+    .pdf-marker {
+      position: absolute;
+      left: 2px;
+      top: 0;
+      color: #2563eb;
+      letter-spacing: normal;
+    }
+
+    .pdf-marker.number {
+      left: 0;
+      color: #0f172a;
+      font-weight: 700;
+    }
+
+    .pdf-body strong {
+      color: #0f172a;
+    }
+
+    .pdf-body a {
+      color: #1d4ed8;
+      text-decoration: none;
+    }
+
+    .pdf-body hr {
+      margin: 12px 0;
+      border: none;
+      border-top: 1px solid #e5e7eb;
+    }
+
+    .pdf-body blockquote {
+      margin: 8px 0;
+      padding-left: 10px;
+      border-left: 3px solid #cbd5e1;
+      color: #475569;
+    }
+
+    .pdf-body pre,
+    .pdf-body code {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 9.5px;
+      white-space: pre-wrap;
+    }
+
+    .pdf-body table {
+      width: 100%;
+      margin: 8px 0 12px;
+      border-collapse: collapse;
+      font-size: 10.5px;
+      line-height: 1.4;
+    }
+
+    .pdf-body th,
+    .pdf-body td {
+      padding: 4px 5px;
+      border: 1px solid #dbe3ee;
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: break-word; /* long words wrap instead of spilling over (html2canvas ignores "anywhere") */
+    }
+
+    .pdf-body th {
+      background: #eff6ff;
+      color: #0f172a;
+      font-weight: 700;
+    }
+
+    .pdf-body tr.pdf-spacer td {
+      padding: 0;
+      border: none;
+      background: transparent;
+    }
+  `;
+
+  function ensureStyles() {
+    if (document.getElementById("tripbuddy-pdf-styles")) return;
+    const style = document.createElement("style");
+    style.id = "tripbuddy-pdf-styles";
+    style.textContent = PDF_CSS;
+    document.head.appendChild(style);
+  }
+
   const PAGE = { widthMm: 210, heightMm: 297, marginMm: 12 };
   const MM_TO_PX = 96 / 25.4;
   const SAFETY_PX = 6; // breathing room so nothing sits right on a page edge
@@ -37,6 +242,11 @@
       let number = ordered ? parseInt(list.getAttribute("start") || "1", 10) : 0;
       for (const item of list.children) {
         if (item.tagName !== "LI") continue;
+        // Checklist items ("- [ ] ...") already show a checkbox; no bullet needed
+        if (!ordered && item.querySelector(":scope > input[type=checkbox], :scope > p:first-child > input[type=checkbox]")) {
+          item.classList.add("pdf-task");
+          continue;
+        }
         const text = ordered ? `${number++}.` : nested ? "◦" : "•";
         item.insertBefore(el("span", ordered ? "pdf-marker number" : "pdf-marker", text), item.firstChild);
       }
@@ -47,6 +257,8 @@
     const host = el("div", "pdf-host");
     const sheet = el("div", "pdf-sheet");
     sheet.style.width = `${innerWidthMm}mm`;
+    sheet.style.color = "#1f2937"; // never inherit the site's white text
+    sheet.style.background = "#ffffff";
     const header = el("header", "pdf-header");
     header.append(el("div", "pdf-brand", "TripBuddy"), el("h1", "pdf-doc-title", title));
     if (subtitle) header.appendChild(el("p", "pdf-doc-subtitle", subtitle));
@@ -156,6 +368,7 @@
     if (typeof html2pdf === "undefined") {
       throw new Error("The PDF library didn't load. Check your internet connection and reload.");
     }
+    ensureStyles();
     const { host, sheet } = buildSheet(source, title, subtitle);
     try {
       const sheetWidthPx = sheet.getBoundingClientRect().width;

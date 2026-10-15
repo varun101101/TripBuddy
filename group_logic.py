@@ -262,11 +262,16 @@ def tally_votes(votes: list[dict[str, Any]], rule: str = "all") -> dict[str, Any
     else:
         approved = total > 0 and approvals == total
 
-    change_requests = [
-        f"- {v['name']}: {v['feedback'].strip()}"
-        for v in votes
-        if v["decision"] == "revise" and (v.get("feedback") or "").strip()
-    ]
+    # Every comment reaches the agents, including notes left with an approval
+    # ("approve, but add a rest day"). The vote list shows them to the group,
+    # so dropping them here would silently ignore what members asked for.
+    change_requests = []
+    for v in votes:
+        note = (v.get("feedback") or "").strip()
+        if not note:
+            continue
+        label = v["name"] if v["decision"] == "revise" else f"{v['name']} (approved)"
+        change_requests.append(f"- {label}: {note}")
     return {
         "approved": approved,
         "approvals": approvals,

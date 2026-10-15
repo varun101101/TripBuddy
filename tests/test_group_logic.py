@@ -100,3 +100,12 @@ def test_tally_majority_rule():
     assert tally_votes(votes, "majority")["approved"] is True
     tie = votes[:1] + [{"name": "B", "decision": "revise", "feedback": "x"}]
     assert tally_votes(tie, "majority")["approved"] is False
+
+
+def test_tally_keeps_notes_left_with_an_approval():
+    votes = [{"name": "A", "decision": "approve", "feedback": "add a rest day"},
+             {"name": "B", "decision": "approve", "feedback": ""},
+             {"name": "C", "decision": "revise", "feedback": "cheaper hotel"}]
+    result = tally_votes(votes, "majority")
+    assert result["approved"] is True
+    assert result["combined_feedback"] == "- A (approved): add a rest day\n- C: cheaper hotel"

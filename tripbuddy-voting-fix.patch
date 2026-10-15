@@ -1,0 +1,269 @@
+diff --git a/app.py b/app.py
+index 018ad69..2d6cc12 100644
+--- a/app.py
++++ b/app.py
+@@ -388,7 +388,7 @@ def vote_on_group_trip(trip_id: str, data: VoteRequest):
+             traceback.print_exc()
+             store.set_status(trip_id, store.AWAITING_VOTES)
+             return _error(
+-                f"Couldn't continue the plan: {exc}. Any member can vote again to retry.", 500
++                f"Couldn't continue the plan: {exc}. Votes are saved; any member can press Try again.", 500
+             )
+         if result["requires_approval"]:
+             store.set_status(trip_id, store.AWAITING_VOTES, current_round=outcome["round"] + 1)
+diff --git a/group_logic.py b/group_logic.py
+index b985e23..e00e901 100644
+--- a/group_logic.py
++++ b/group_logic.py
+@@ -262,11 +262,16 @@ def tally_votes(votes: list[dict[str, Any]], rule: str = "all") -> dict[str, Any
+     else:
+         approved = total > 0 and approvals == total
+ 
+-    change_requests = [
+-        f"- {v['name']}: {v['feedback'].strip()}"
+-        for v in votes
+-        if v["decision"] == "revise" and (v.get("feedback") or "").strip()
+-    ]
++    # Every comment reaches the agents, including notes left with an approval
++    # ("approve, but add a rest day"). The vote list shows them to the group,
++    # so dropping them here would silently ignore what members asked for.
++    change_requests = []
++    for v in votes:
++        note = (v.get("feedback") or "").strip()
++        if not note:
++            continue
++        label = v["name"] if v["decision"] == "revise" else f"{v['name']} (approved)"
++        change_requests.append(f"- {label}: {note}")
+     return {
+         "approved": approved,
+         "approvals": approvals,
+diff --git a/group_store.py b/group_store.py
+index 5c26112..2fffad7 100644
+--- a/group_store.py
++++ b/group_store.py
+@@ -364,23 +364,35 @@ def record_vote(trip_id: str, member_id: str, decision: str, feedback: str) -> d
+         if member is None:
+             raise TripError("You are not a member of this trip.", 403)
+         round_no = trip["current_round"]
+-        conn.execute(
+-            """
+-            INSERT INTO member_votes (trip_id, member_id, round, decision, feedback)
+-            VALUES (%s, %s, %s, %s, %s)
+-            ON CONFLICT (trip_id, member_id, round)
+-            DO UPDATE SET decision = EXCLUDED.decision, feedback = EXCLUDED.feedback,
+-                          voted_at = now()
+-            """,
+-            (trip_id, member_id, round_no, decision, feedback),
+-        )
+-        counts = conn.execute(
+-            """
+-            SELECT (SELECT count(*) FROM trip_members WHERE trip_id = %(t)s) AS members,
+-                   (SELECT count(*) FROM member_votes WHERE trip_id = %(t)s AND round = %(r)s) AS votes
+-            """,
+-            {"t": trip_id, "r": round_no},
+-        ).fetchone()
++
++        def count_votes():
++            return conn.execute(
++                """
++                SELECT (SELECT count(*) FROM trip_members WHERE trip_id = %(t)s) AS members,
++                       (SELECT count(*) FROM member_votes WHERE trip_id = %(t)s AND round = %(r)s) AS votes
++                """,
++                {"t": trip_id, "r": round_no},
++            ).fetchone()
++
++        # Once everyone has voted, the round is closed. The trip can only be
++        # back in 'awaiting_votes' with a full round if continuing the plan
++        # failed (e.g. a Groq timeout). The graph may already have counted
++        # these votes before failing, so a changed vote would be ignored by
++        # the plan while the page showed it. Keep the votes as they were and
++        # treat this request as a retry.
++        counts = count_votes()
++        if counts["votes"] < counts["members"]:
++            conn.execute(
++                """
++                INSERT INTO member_votes (trip_id, member_id, round, decision, feedback)
++                VALUES (%s, %s, %s, %s, %s)
++                ON CONFLICT (trip_id, member_id, round)
++                DO UPDATE SET decision = EXCLUDED.decision, feedback = EXCLUDED.feedback,
++                              voted_at = now()
++                """,
++                (trip_id, member_id, round_no, decision, feedback),
++            )
++            counts = count_votes()
+         complete = counts["votes"] >= counts["members"]
+         if complete:
+             conn.execute(
+diff --git a/static/group.js b/static/group.js
+index 2879a9c..b0ee79b 100644
+--- a/static/group.js
++++ b/static/group.js
+@@ -351,9 +351,11 @@ function renderVote(view) {
+   if (!open) return;
+ 
+   const maxRounds = trip.max_revisions + 1;
++  const lastRound = trip.current_round >= maxRounds;
+   $("roundLabel").textContent = `Group vote · round ${trip.current_round} of up to ${maxRounds}`;
+-  $("voteRule").textContent =
+-    `${trip.approval_rule_label}. If the draft isn't approved, the itinerary agent revises it using everyone's requests.`;
++  $("voteRule").textContent = lastRound
++    ? `${trip.approval_rule_label}. This is the last round: after it, the plan is finalised either way, applying everyone's requests where the group rules allow.`
++    : `${trip.approval_rule_label}. If the draft isn't approved, the itinerary agent revises it using everyone's requests.`;
+ 
+   const list = $("voteStatus");
+   list.replaceChildren();
+@@ -368,12 +370,26 @@ function renderVote(view) {
+     list.appendChild(li);
+   }
+ 
++  // Everyone has voted but the trip is still waiting: the last attempt to
++  // update the plan failed. Votes are locked now, so offer a retry instead.
++  const stuck = view.waiting_for.length === 0;
++  show("voteFeedback", !stuck);
++  show("approveBtn", !stuck);
++  show("reviseBtn", !stuck);
++  show("retryBtn", stuck);
++
+   const mine = view.you.my_vote;
+-  $("myVoteNote").textContent = mine
+-    ? `You ${mine.decision === "approve" ? "approved" : "asked for changes"}. You can change your vote until everyone has voted.`
+-    : "";
++  if (stuck) {
++    $("myVoteNote").textContent =
++      "Everyone has voted, but the plan couldn't be updated (the AI service may have timed out). Votes are locked; press Try again.";
++  } else {
++    $("myVoteNote").textContent = mine
++      ? `You ${mine.decision === "approve" ? "approved" : "asked for changes"}. You can change your vote until everyone has voted.`
++      : "";
++  }
+   $("approveBtn").disabled = app.busy;
+   $("reviseBtn").disabled = app.busy;
++  $("retryBtn").disabled = app.busy;
+ }
+ 
+ function renderDashboard(view) {
+@@ -473,6 +489,25 @@ async function onVote(decision) {
+   }
+ }
+ 
++async function onRetry() {
++  // Re-send this member's own (locked) vote; the server just continues the plan.
++  hideError();
++  const mine = app.view.you.my_vote;
++  if (!mine) return;
++  app.busy = true;
++  renderDashboard(app.view);
++  try {
++    await api("POST", `/api/trips/${app.tripId}/vote`, {
++      member_id: app.memberId, decision: mine.decision, feedback: mine.feedback || "",
++    });
++  } catch (error) {
++    showError(error.message);
++  } finally {
++    app.busy = false;
++    await loadTrip({ silent: true });
++  }
++}
++
+ async function onEditSave(event) {
+   event.preventDefault();
+   hideError();
+@@ -534,6 +569,7 @@ function start() {
+   $("cancelEditBtn").addEventListener("click", () => show("editForm", false));
+   $("approveBtn").addEventListener("click", () => onVote("approve"));
+   $("reviseBtn").addEventListener("click", () => onVote("revise"));
++  $("retryBtn").addEventListener("click", onRetry);
+   $("copyLinkBtn").addEventListener("click", (e) => copyText($("shareLink").value, e.target));
+   $("copyPlanBtn").addEventListener("click", (e) => copyText($("planBox").innerText, e.target));
+   $("downloadBtn").addEventListener("click", downloadPdf);
+diff --git a/templates/group.html b/templates/group.html
+index 8feb32d..024d5be 100644
+--- a/templates/group.html
++++ b/templates/group.html
+@@ -176,6 +176,7 @@
+           <div class="approval-actions">
+             <button id="approveBtn" class="approve-btn" type="button">Approve draft</button>
+             <button id="reviseBtn" class="revise-btn" type="button">Ask for changes</button>
++            <button id="retryBtn" class="approve-btn hidden" type="button">Try again</button>
+           </div>
+         </div>
+       </section>
+diff --git a/tests/test_group_api.py b/tests/test_group_api.py
+index 8ef6ce9..2a8d26c 100644
+--- a/tests/test_group_api.py
++++ b/tests/test_group_api.py
+@@ -280,6 +280,57 @@ def test_revision_limit_then_final(env):
+     assert "- Bina: change 3" in final_prompt
+ 
+ 
++def test_approval_note_reaches_final_plan(env):
++    client, llm = env["client"], env["llm"]
++    trip_id, varun = create_trip(client)
++    b = join(client, trip_id, person("Bina"))
++    client.post(f"/api/trips/{trip_id}/plan", json={"member_id": varun})
++    vote(client, trip_id, varun, "approve", "Looks good, but add a rest day")
++    view = vote(client, trip_id, b, "approve").json()
++    assert view["trip"]["status"] == "completed"
++    final_prompt = [p for s, p in llm.prompts if "booking assistant" in s][-1]
++    assert "- Varun (approved): Looks good, but add a rest day" in final_prompt
++
++
++def test_votes_lock_after_failed_resume_and_retry_uses_them(env):
++    """If the plan update crashes after the votes were counted, a retry must not
++    let anyone change their vote, because the graph already acted on it."""
++    client, llm = env["client"], env["llm"]
++    trip_id, varun = create_trip(client)
++    b = join(client, trip_id, person("Bina"))
++    client.post(f"/api/trips/{trip_id}/plan", json={"member_id": varun})
++    vote(client, trip_id, varun, "approve")
++
++    real = llm.invoke
++    failing = {"on": True}
++
++    def flaky(messages):
++        if failing["on"] and not isinstance(messages, str) \
++                and "expert travel planner" in messages[0].content:
++            raise RuntimeError("Groq timeout")
++        return real(messages)
++
++    llm.invoke = flaky
++    try:
++        r = vote(client, trip_id, b, "revise", "cheaper hotel")
++        assert r.status_code == 500
++        view = client.get(f"/api/trips/{trip_id}", params={"member_id": b}).json()
++        assert view["trip"]["status"] == "awaiting_votes"
++        assert view["waiting_for"] == []
++
++        failing["on"] = False
++        view = vote(client, trip_id, b, "approve").json()  # tries to switch to approve
++    finally:
++        llm.invoke = real
++
++    assert view["trip"]["status"] == "awaiting_votes"
++    assert view["trip"]["current_round"] == 2
++    assert "What changed: cheaper hotel" in view["plan"]["answer"]
++    import group_store as store
++    round1 = {v["name"]: v["decision"] for v in store.votes_for_round(trip_id, 1)}
++    assert round1 == {"Varun": "approve", "Bina": "revise"}  # matches what the plan used
++
++
+ def test_simultaneous_last_votes_resume_only_once(env):
+     import group_store as store
+ 
+diff --git a/tests/test_group_logic.py b/tests/test_group_logic.py
+index 50674bb..b547548 100644
+--- a/tests/test_group_logic.py
++++ b/tests/test_group_logic.py
+@@ -100,3 +100,12 @@ def test_tally_majority_rule():
+     assert tally_votes(votes, "majority")["approved"] is True
+     tie = votes[:1] + [{"name": "B", "decision": "revise", "feedback": "x"}]
+     assert tally_votes(tie, "majority")["approved"] is False
++
++
++def test_tally_keeps_notes_left_with_an_approval():
++    votes = [{"name": "A", "decision": "approve", "feedback": "add a rest day"},
++             {"name": "B", "decision": "approve", "feedback": ""},
++             {"name": "C", "decision": "revise", "feedback": "cheaper hotel"}]
++    result = tally_votes(votes, "majority")
++    assert result["approved"] is True
++    assert result["combined_feedback"] == "- A (approved): add a rest day\n- C: cheaper hotel"

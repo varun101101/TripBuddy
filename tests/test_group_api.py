@@ -280,6 +280,57 @@ def test_revision_limit_then_final(env):
     assert "- Bina: change 3" in final_prompt
 
 
+def test_approval_note_reaches_final_plan(env):
+    client, llm = env["client"], env["llm"]
+    trip_id, varun = create_trip(client)
+    b = join(client, trip_id, person("Bina"))
+    client.post(f"/api/trips/{trip_id}/plan", json={"member_id": varun})
+    vote(client, trip_id, varun, "approve", "Looks good, but add a rest day")
+    view = vote(client, trip_id, b, "approve").json()
+    assert view["trip"]["status"] == "completed"
+    final_prompt = [p for s, p in llm.prompts if "booking assistant" in s][-1]
+    assert "- Varun (approved): Looks good, but add a rest day" in final_prompt
+
+
+def test_votes_lock_after_failed_resume_and_retry_uses_them(env):
+    """If the plan update crashes after the votes were counted, a retry must not
+    let anyone change their vote, because the graph already acted on it."""
+    client, llm = env["client"], env["llm"]
+    trip_id, varun = create_trip(client)
+    b = join(client, trip_id, person("Bina"))
+    client.post(f"/api/trips/{trip_id}/plan", json={"member_id": varun})
+    vote(client, trip_id, varun, "approve")
+
+    real = llm.invoke
+    failing = {"on": True}
+
+    def flaky(messages):
+        if failing["on"] and not isinstance(messages, str) \
+                and "expert travel planner" in messages[0].content:
+            raise RuntimeError("Groq timeout")
+        return real(messages)
+
+    llm.invoke = flaky
+    try:
+        r = vote(client, trip_id, b, "revise", "cheaper hotel")
+        assert r.status_code == 500
+        view = client.get(f"/api/trips/{trip_id}", params={"member_id": b}).json()
+        assert view["trip"]["status"] == "awaiting_votes"
+        assert view["waiting_for"] == []
+
+        failing["on"] = False
+        view = vote(client, trip_id, b, "approve").json()  # tries to switch to approve
+    finally:
+        llm.invoke = real
+
+    assert view["trip"]["status"] == "awaiting_votes"
+    assert view["trip"]["current_round"] == 2
+    assert "What changed: cheaper hotel" in view["plan"]["answer"]
+    import group_store as store
+    round1 = {v["name"]: v["decision"] for v in store.votes_for_round(trip_id, 1)}
+    assert round1 == {"Varun": "approve", "Bina": "revise"}  # matches what the plan used
+
+
 def test_simultaneous_last_votes_resume_only_once(env):
     import group_store as store
 

@@ -388,7 +388,7 @@ def vote_on_group_trip(trip_id: str, data: VoteRequest):
             traceback.print_exc()
             store.set_status(trip_id, store.AWAITING_VOTES)
             return _error(
-                f"Couldn't continue the plan: {exc}. Any member can vote again to retry.", 500
+                f"Couldn't continue the plan: {exc}. Votes are saved; any member can press Try again.", 500
             )
         if result["requires_approval"]:
             store.set_status(trip_id, store.AWAITING_VOTES, current_round=outcome["round"] + 1)

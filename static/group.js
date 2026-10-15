@@ -351,9 +351,11 @@ function renderVote(view) {
   if (!open) return;
 
   const maxRounds = trip.max_revisions + 1;
+  const lastRound = trip.current_round >= maxRounds;
   $("roundLabel").textContent = `Group vote · round ${trip.current_round} of up to ${maxRounds}`;
-  $("voteRule").textContent =
-    `${trip.approval_rule_label}. If the draft isn't approved, the itinerary agent revises it using everyone's requests.`;
+  $("voteRule").textContent = lastRound
+    ? `${trip.approval_rule_label}. This is the last round: after it, the plan is finalised either way, applying everyone's requests where the group rules allow.`
+    : `${trip.approval_rule_label}. If the draft isn't approved, the itinerary agent revises it using everyone's requests.`;
 
   const list = $("voteStatus");
   list.replaceChildren();
@@ -368,12 +370,26 @@ function renderVote(view) {
     list.appendChild(li);
   }
 
+  // Everyone has voted but the trip is still waiting: the last attempt to
+  // update the plan failed. Votes are locked now, so offer a retry instead.
+  const stuck = view.waiting_for.length === 0;
+  show("voteFeedback", !stuck);
+  show("approveBtn", !stuck);
+  show("reviseBtn", !stuck);
+  show("retryBtn", stuck);
+
   const mine = view.you.my_vote;
-  $("myVoteNote").textContent = mine
-    ? `You ${mine.decision === "approve" ? "approved" : "asked for changes"}. You can change your vote until everyone has voted.`
-    : "";
+  if (stuck) {
+    $("myVoteNote").textContent =
+      "Everyone has voted, but the plan couldn't be updated (the AI service may have timed out). Votes are locked; press Try again.";
+  } else {
+    $("myVoteNote").textContent = mine
+      ? `You ${mine.decision === "approve" ? "approved" : "asked for changes"}. You can change your vote until everyone has voted.`
+      : "";
+  }
   $("approveBtn").disabled = app.busy;
   $("reviseBtn").disabled = app.busy;
+  $("retryBtn").disabled = app.busy;
 }
 
 function renderDashboard(view) {
@@ -473,6 +489,25 @@ async function onVote(decision) {
   }
 }
 
+async function onRetry() {
+  // Re-send this member's own (locked) vote; the server just continues the plan.
+  hideError();
+  const mine = app.view.you.my_vote;
+  if (!mine) return;
+  app.busy = true;
+  renderDashboard(app.view);
+  try {
+    await api("POST", `/api/trips/${app.tripId}/vote`, {
+      member_id: app.memberId, decision: mine.decision, feedback: mine.feedback || "",
+    });
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    app.busy = false;
+    await loadTrip({ silent: true });
+  }
+}
+
 async function onEditSave(event) {
   event.preventDefault();
   hideError();
@@ -534,6 +569,7 @@ function start() {
   $("cancelEditBtn").addEventListener("click", () => show("editForm", false));
   $("approveBtn").addEventListener("click", () => onVote("approve"));
   $("reviseBtn").addEventListener("click", () => onVote("revise"));
+  $("retryBtn").addEventListener("click", onRetry);
   $("copyLinkBtn").addEventListener("click", (e) => copyText($("shareLink").value, e.target));
   $("copyPlanBtn").addEventListener("click", (e) => copyText($("planBox").innerText, e.target));
   $("downloadBtn").addEventListener("click", downloadPdf);

@@ -364,23 +364,35 @@ def record_vote(trip_id: str, member_id: str, decision: str, feedback: str) -> d
         if member is None:
             raise TripError("You are not a member of this trip.", 403)
         round_no = trip["current_round"]
-        conn.execute(
-            """
-            INSERT INTO member_votes (trip_id, member_id, round, decision, feedback)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (trip_id, member_id, round)
-            DO UPDATE SET decision = EXCLUDED.decision, feedback = EXCLUDED.feedback,
-                          voted_at = now()
-            """,
-            (trip_id, member_id, round_no, decision, feedback),
-        )
-        counts = conn.execute(
-            """
-            SELECT (SELECT count(*) FROM trip_members WHERE trip_id = %(t)s) AS members,
-                   (SELECT count(*) FROM member_votes WHERE trip_id = %(t)s AND round = %(r)s) AS votes
-            """,
-            {"t": trip_id, "r": round_no},
-        ).fetchone()
+
+        def count_votes():
+            return conn.execute(
+                """
+                SELECT (SELECT count(*) FROM trip_members WHERE trip_id = %(t)s) AS members,
+                       (SELECT count(*) FROM member_votes WHERE trip_id = %(t)s AND round = %(r)s) AS votes
+                """,
+                {"t": trip_id, "r": round_no},
+            ).fetchone()
+
+        # Once everyone has voted, the round is closed. The trip can only be
+        # back in 'awaiting_votes' with a full round if continuing the plan
+        # failed (e.g. a Groq timeout). The graph may already have counted
+        # these votes before failing, so a changed vote would be ignored by
+        # the plan while the page showed it. Keep the votes as they were and
+        # treat this request as a retry.
+        counts = count_votes()
+        if counts["votes"] < counts["members"]:
+            conn.execute(
+                """
+                INSERT INTO member_votes (trip_id, member_id, round, decision, feedback)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (trip_id, member_id, round)
+                DO UPDATE SET decision = EXCLUDED.decision, feedback = EXCLUDED.feedback,
+                              voted_at = now()
+                """,
+                (trip_id, member_id, round_no, decision, feedback),
+            )
+            counts = count_votes()
         complete = counts["votes"] >= counts["members"]
         if complete:
             conn.execute(

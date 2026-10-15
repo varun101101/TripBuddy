@@ -242,10 +242,10 @@ function copyResult() {
     });
 }
 
-function downloadPDF() {
-  const pdfContent = document.getElementById("pdfContent");
+async function downloadPDF() {
+  const resultBox = document.getElementById("resultBox");
 
-  if (!latestAnswerMarkdown || !pdfContent) {
+  if (!latestAnswerMarkdown || !resultBox) {
     showError("No travel plan available to download.");
     return;
   }
@@ -255,41 +255,24 @@ function downloadPDF() {
   downloadBtn.textContent = "Preparing PDF...";
   downloadBtn.disabled = true;
 
-  const options = {
-    margin: 0.5,
-    filename: "ai-travel-plan.pdf",
-    image: {
-      type: "jpeg",
-      quality: 0.98
-    },
-    html2canvas: {
-      scale: 2,
-      useCORS: true,
-      backgroundColor: "#ffffff"
-    },
-    jsPDF: {
-      unit: "in",
-      format: "a4",
-      orientation: "portrait"
-    },
-    pagebreak: {
-      mode: ["avoid-all", "css", "legacy"]
-    }
-  };
+  const request = document.getElementById("userInput").value.trim();
+  const isDraft = document.getElementById("resultTitle").textContent.startsWith("Draft");
+  const today = new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+  const slug = (request || "travel-plan").toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 50);
 
-  html2pdf()
-    .set(options)
-    .from(pdfContent)
-    .save()
-    .then(() => {
-      downloadBtn.textContent = oldText;
-      downloadBtn.disabled = false;
-    })
-    .catch(() => {
-      downloadBtn.textContent = oldText;
-      downloadBtn.disabled = false;
-      showError("Could not download PDF.");
+  try {
+    await TripBuddyPdf.save({
+      source: resultBox,
+      title: isDraft ? "Draft Travel Plan" : "Your Travel Plan",
+      subtitle: [request.slice(0, 140), today].filter(Boolean).join(" · "),
+      filename: `tripbuddy-${slug.replace(/^-|-$/g, "") || "plan"}.pdf`,
     });
+  } catch (error) {
+    showError(error.message || "Could not download PDF.");
+  } finally {
+    downloadBtn.textContent = oldText;
+    downloadBtn.disabled = false;
+  }
 }
 
 document.addEventListener("keydown", function(event) {

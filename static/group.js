@@ -542,27 +542,28 @@ function copyText(text, button) {
   }).catch(() => showError("Could not copy."));
 }
 
-function downloadPdf() {
-  if (typeof html2pdf === "undefined") {
-    showError("The PDF library didn't load. Check your internet connection.");
-    return;
-  }
-  const slug = (app.view.trip.title || "trip").toLowerCase().replace(/[^a-z0-9]+/g, "-");
-  const title = $("pdfTitle");
-  title.style.display = "block";
-  html2pdf()
-    .set({
-      margin: 0.5,
+async function downloadPdf() {
+  const trip = app.view.trip;
+  const plan = app.view.plan || {};
+  const slug = (trip.title || "trip").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const today = new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+  const stage = trip.status === "completed"
+    ? `Final group plan${plan.vote_summary ? ` · ${plan.vote_summary}` : ""}`
+    : `Draft plan · voting round ${trip.current_round}`;
+  const button = $("downloadBtn");
+  button.disabled = true;
+  try {
+    await TripBuddyPdf.save({
+      source: $("planBox"),
+      title: trip.title,
+      subtitle: `${stage} · ${today}`,
       filename: `tripbuddy-${slug}.pdf`,
-      image: { type: "jpeg", quality: 0.98 },
-      html2canvas: { scale: 2, useCORS: true, backgroundColor: "#ffffff" },
-      jsPDF: { unit: "in", format: "a4", orientation: "portrait" },
-      pagebreak: { mode: ["avoid-all", "css", "legacy"] },
-    })
-    .from($("pdfContent"))
-    .save()
-    .catch(() => showError("Could not create the PDF."))
-    .finally(() => { title.style.display = ""; });
+    });
+  } catch (error) {
+    showError(error.message || "Could not create the PDF.");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 // ---------- start ----------

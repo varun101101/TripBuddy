@@ -303,6 +303,8 @@ def _trip_view(trip_id: str, member_id: str | None, user: dict | None = None) ->
     round_no = trip["current_round"]
     votes = store.votes_for_round(trip_id, round_no) if round_no else []
     voted_names = {v["name"] for v in votes}
+    # What the group asked for last round, so voters can check the revision
+    previous_votes = store.votes_for_round(trip_id, round_no - 1) if round_no and round_no > 1 else []
 
     return JSONResponse(content={
         "success": True,
@@ -324,6 +326,7 @@ def _trip_view(trip_id: str, member_id: str | None, user: dict | None = None) ->
         "preview": preview,
         "plan": plan,
         "votes": votes,
+        "previous_votes": previous_votes,
         "waiting_for": [m["name"] for m in members if round_no and m["name"] not in voted_names],
     })
 

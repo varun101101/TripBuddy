@@ -348,6 +348,26 @@ textarea.short {
   max-width: 420px;
 }
 
+.previous-requests {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  background: rgba(37, 99, 235, 0.1);
+  color: #dbeafe;
+}
+
+.previous-requests .previous-title {
+  margin: 0 0 6px;
+  color: #bfdbfe;
+  font-weight: 750;
+}
+
+.previous-requests ul {
+  margin: 0 0 6px 18px;
+  line-height: 1.6;
+}
+
 @media (max-width: 760px) {
   .form-grid {
     grid-template-columns: 1fr;

@@ -43,6 +43,16 @@ app.mount(
     name="static",
 )
 
+
+@app.middleware("http")
+async def revalidate_static_files(request: Request, call_next):
+    """Make browsers check for newer JS/CSS on each load (a quick 304 when unchanged),
+    so an updated script is never paired with a stale cached stylesheet."""
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 

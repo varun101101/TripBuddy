@@ -22,7 +22,7 @@ from langchain_core.messages import (
     AIMessage,
     SystemMessage,
 )
-from langchain_groq import ChatGroq
+from llm_provider import make_llm
 
 
 from mcp_client import (
@@ -56,22 +56,11 @@ def get_database_url():
     return database_url
 
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY is missing. Please add it to your .env file.")
-
 # =========================
 # LLM - original model kept
 # =========================
-# GROQ_MODEL lets you switch models from .env without touching code,
-# e.g. GROQ_MODEL=openai/gpt-oss-120b if your free key can't use Llama 3.3.
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-
-llm = ChatGroq(
-    model=GROQ_MODEL,
-    api_key=GROQ_API_KEY,
-)
+# Served through OpenRouter; the model is set in .env. See llm_provider.py.
+llm = make_llm()
 
 # =========================
 # State - original fields kept, new control fields added
@@ -278,7 +267,7 @@ User request:
 
     if not allowed:
         reason = guardrail_reason or (
-            "TripMate AI can only help with travel-planning requests. "
+            "TripBuddy AI can only help with travel-planning requests. "
             "Please ask about a destination, flight, hotel, weather, budget, "
             "or itinerary."
         )
@@ -1094,7 +1083,7 @@ def resume_group_plan(thread_id: str, votes: list[dict[str, Any]]):
     if waiting_for_votes:
         result = travel_graph.invoke(Command(resume={"votes": votes}), config=config)
     else:
-        # A previous resume crashed after the votes were counted (e.g. Groq
+        # A previous resume crashed after the votes were counted (e.g. OpenRouter
         # timed out while revising). Continue from the last saved step.
         result = travel_graph.invoke(None, config=config)
     return _serialize_result(result, thread_id)

@@ -52,7 +52,7 @@ uvicorn app:app --reload --host 127.0.0.1 --port 8000
 
 4. Open the web UI
 
-Visit http://127.0.0.1:8000 in your browser to use the TripMate frontend.
+Visit http://127.0.0.1:8000 in your browser to use the TripBuddy frontend.
 
 Running the MCP server (example)
 - The repository includes `custom_weather_mcp_server.py` as an example MCP server. Run it in a separate terminal if you want to experiment with custom adapters used by the demo.
@@ -69,6 +69,7 @@ API Endpoints
 
 Configuration & environment
 - Secrets and API keys are not included in the repo. Use environment variables or a `.env` file for any required keys consumed by `langgraph`, `langchain`, or other adapters.
+- AI model: TripBuddy uses `openai/gpt-oss-120b` through OpenRouter. Set `OPENROUTER_API_KEY` in `.env`; `LLM_MODEL` optionally picks a different OpenRouter model.
 
 Development notes
 - The project keeps synchronous convenience wrappers in `backend.py` while running an async FastAPI server — `nest_asyncio` is applied in `app.py` to allow the sync helpers to call async MCP helpers.

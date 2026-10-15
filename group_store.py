@@ -376,7 +376,7 @@ def record_vote(trip_id: str, member_id: str, decision: str, feedback: str) -> d
 
         # Once everyone has voted, the round is closed. The trip can only be
         # back in 'awaiting_votes' with a full round if continuing the plan
-        # failed (e.g. a Groq timeout). The graph may already have counted
+        # failed (e.g. an OpenRouter timeout). The graph may already have counted
         # these votes before failing, so a changed vote would be ignored by
         # the plan while the page showed it. Keep the votes as they were and
         # treat this request as a retry.

@@ -68,7 +68,7 @@ class FakeLLM:
 @pytest.fixture(scope="module")
 def env():
     os.environ["DATABASE_URL"] = TEST_DB
-    os.environ["GROQ_API_KEY"] = "test-key"
+    os.environ["OPENROUTER_API_KEY"] = "test-key"
     import backend
     import mcp_client
 
@@ -307,7 +307,7 @@ def test_votes_lock_after_failed_resume_and_retry_uses_them(env):
     def flaky(messages):
         if failing["on"] and not isinstance(messages, str) \
                 and "expert travel planner" in messages[0].content:
-            raise RuntimeError("Groq timeout")
+            raise RuntimeError("OpenRouter timeout")
         return real(messages)
 
     llm.invoke = flaky

@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from backend import (
+    delete_plan_history,
     get_group_plan,
     resume_group_plan,
     resume_travel_agent,
@@ -484,6 +485,32 @@ def open_saved_plan(thread_id: str, request: Request):
     if plan is None:
         return _error("This plan's details are no longer available.", 404)
     return {"success": True, "title": saved["title"], "status": saved["status"], **plan}
+
+
+@app.delete("/api/me/plans/{thread_id}")
+def delete_saved_plan(thread_id: str, request: Request):
+    user = accounts.current_user(request)
+    if not user:
+        return _error("Log in to delete your saved plans.", 401)
+    if not accounts.delete_solo_plan(user["user_id"], thread_id):
+        return _error("Plan not found in your account.", 404)
+    delete_plan_history(thread_id)
+    return {"success": True}
+
+
+@app.delete("/api/me/trips/{trip_id}")
+def delete_or_leave_group_trip(trip_id: str, request: Request):
+    """Organiser: delete the trip for everyone. Member: remove it from My trips."""
+    user = accounts.current_user(request)
+    if not user:
+        return _error("Log in to change your trips.", 401)
+    try:
+        outcome, threads = accounts.remove_group_trip(user["user_id"], trip_id)
+    except store.TripError as exc:
+        return _error(str(exc), exc.status_code)
+    for thread_id in threads:
+        delete_plan_history(thread_id)
+    return {"success": True, "outcome": outcome}
 
 
 if __name__ == "__main__":

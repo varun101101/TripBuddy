@@ -1,0 +1,288 @@
+/* Light/dark mode. The site's own stylesheets are the dark theme; these rules
+   switch it to light when <html data-theme="light"> (set by static/theme.js).
+   Loaded last on every page so it wins over the dark colours. */
+
+/* ---------- theme toggle button (both themes) ---------- */
+.theme-toggle {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.72);
+  color: #e2e8f0;
+  cursor: pointer;
+  transition: 0.2s ease;
+}
+
+.theme-toggle:hover {
+  border-color: rgba(96, 165, 250, 0.6);
+  transform: translateY(-1px);
+}
+
+.theme-toggle svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* Pages without an account bar (the login page) */
+.theme-toggle.floating {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  z-index: 5;
+}
+
+/* ---------- light theme ---------- */
+:root[data-theme="light"] body {
+  background: #f4f7fb;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .page-bg {
+  background:
+    radial-gradient(circle at top left, rgba(56, 189, 248, 0.16), transparent 32%),
+    radial-gradient(circle at top right, rgba(168, 85, 247, 0.12), transparent 28%),
+    linear-gradient(135deg, #f8fafc 0%, #eef2ff 45%, #f1f5f9 100%);
+}
+
+:root[data-theme="light"] .gradient-circle {
+  opacity: 0.16;
+}
+
+:root[data-theme="light"] .theme-toggle,
+:root[data-theme="light"] .account-btn.ghost,
+:root[data-theme="light"] .badge {
+  border-color: rgba(15, 23, 42, 0.14);
+  background: rgba(255, 255, 255, 0.85);
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .badge {
+  color: #6d28d9;
+}
+
+:root[data-theme="light"] .hero-section h1 {
+  background: linear-gradient(135deg, #0f172a, #1d4ed8, #7c3aed);
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+
+:root[data-theme="light"] .hero-section p,
+:root[data-theme="light"] .auth-status {
+  color: #475569;
+}
+
+:root[data-theme="light"] .group-link {
+  border-color: rgba(37, 99, 235, 0.35);
+  background: rgba(37, 99, 235, 0.08);
+  color: #1d4ed8;
+}
+
+:root[data-theme="light"] .group-link:hover {
+  background: rgba(37, 99, 235, 0.14);
+}
+
+/* Cards */
+:root[data-theme="light"] .planner-card,
+:root[data-theme="light"] .workflow-section,
+:root[data-theme="light"] .result-section {
+  border-color: rgba(15, 23, 42, 0.08);
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.08);
+}
+
+:root[data-theme="light"] .approval-section {
+  border-color: rgba(245, 158, 11, 0.4);
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.12), rgba(255, 255, 255, 0.94));
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.08);
+}
+
+:root[data-theme="light"] .pdf-content {
+  border: 1px solid rgba(15, 23, 42, 0.08);
+}
+
+:root[data-theme="light"] .card-header p,
+:root[data-theme="light"] .result-header p,
+:root[data-theme="light"] .approval-content p,
+:root[data-theme="light"] .muted-line,
+:root[data-theme="light"] .plan-controls,
+:root[data-theme="light"] .working p,
+:root[data-theme="light"] .trip-meta,
+:root[data-theme="light"] .auth-foot {
+  color: #64748b;
+}
+
+:root[data-theme="light"] .eyebrow,
+:root[data-theme="light"] .rules-list dt {
+  color: #2563eb;
+}
+
+:root[data-theme="light"] .supervisor-reasoning,
+:root[data-theme="light"] .share-box {
+  color: #334155;
+}
+
+/* Inputs */
+:root[data-theme="light"] textarea,
+:root[data-theme="light"] .form-grid input,
+:root[data-theme="light"] .form-grid select,
+:root[data-theme="light"] .share-box input {
+  border-color: rgba(15, 23, 42, 0.14);
+  background: #ffffff;
+  color: #0f172a;
+  color-scheme: light;
+}
+
+:root[data-theme="light"] textarea::placeholder,
+:root[data-theme="light"] .form-grid input::placeholder {
+  color: #94a3b8;
+}
+
+:root[data-theme="light"] .form-grid label {
+  color: #334155;
+}
+
+:root[data-theme="light"] .form-subhead,
+:root[data-theme="light"] .account-name,
+:root[data-theme="light"] .member-card dd,
+:root[data-theme="light"] .rules-list dd,
+:root[data-theme="light"] .vote-status .feedback {
+  color: #0f172a;
+}
+
+/* Buttons and chips */
+:root[data-theme="light"] .quick-prompts button {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: #ffffff;
+  color: #1e3a8a;
+}
+
+:root[data-theme="light"] .quick-prompts button:hover,
+:root[data-theme="light"] .copy-btn:hover {
+  border-color: rgba(37, 99, 235, 0.4);
+  background: rgba(59, 130, 246, 0.1);
+}
+
+:root[data-theme="light"] .copy-btn {
+  border-color: rgba(15, 23, 42, 0.15);
+  background: #ffffff;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .agent-chip {
+  border-color: rgba(37, 99, 235, 0.25);
+  background: rgba(37, 99, 235, 0.08);
+  color: #1e40af;
+}
+
+/* Status colours: same hues, darker text so they read on white */
+:root[data-theme="light"] .status-pill,
+:root[data-theme="light"] .guardrail-badge,
+:root[data-theme="light"] .trip-status.good,
+:root[data-theme="light"] .vote-status li.approve {
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.1);
+  color: #15803d;
+}
+
+:root[data-theme="light"] .guardrail-badge.blocked,
+:root[data-theme="light"] .trip-status.bad,
+:root[data-theme="light"] .issue-list.conflict li,
+:root[data-theme="light"] .error-box {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+:root[data-theme="light"] .trip-status.wait,
+:root[data-theme="light"] .vote-status li.revise,
+:root[data-theme="light"] .issue-list.warning li,
+:root[data-theme="light"] .notice {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: #fffbeb;
+  color: #92400e;
+}
+
+:root[data-theme="light"] .trip-status.busy {
+  border-color: rgba(37, 99, 235, 0.3);
+  background: rgba(59, 130, 246, 0.1);
+  color: #1d4ed8;
+}
+
+:root[data-theme="light"] .trip-status,
+:root[data-theme="light"] .vote-status li {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: #ffffff;
+  color: #334155;
+}
+
+/* Group trip page */
+:root[data-theme="light"] .member-card {
+  border-color: rgba(15, 23, 42, 0.1);
+  background: #ffffff;
+}
+
+:root[data-theme="light"] .member-card.you {
+  border-color: rgba(37, 99, 235, 0.5);
+}
+
+:root[data-theme="light"] .member-card dt {
+  color: #64748b;
+}
+
+:root[data-theme="light"] .tag {
+  background: rgba(124, 58, 237, 0.12);
+  color: #6d28d9;
+}
+
+:root[data-theme="light"] .tag.you {
+  background: rgba(37, 99, 235, 0.12);
+  color: #1d4ed8;
+}
+
+:root[data-theme="light"] .edit-form {
+  border-top-color: rgba(15, 23, 42, 0.1);
+}
+
+:root[data-theme="light"] .previous-requests {
+  border-color: rgba(37, 99, 235, 0.25);
+  background: rgba(255, 255, 255, 0.85);
+  color: #1e3a8a;
+}
+
+:root[data-theme="light"] .previous-requests .previous-title {
+  color: #1d4ed8;
+}
+
+/* My trips */
+:root[data-theme="light"] .trip-row {
+  border-color: rgba(15, 23, 42, 0.1);
+  background: #ffffff;
+}
+
+:root[data-theme="light"] .trip-row:hover {
+  border-color: rgba(37, 99, 235, 0.45);
+  background: #f8fafc;
+}
+
+:root[data-theme="light"] .trip-delete {
+  border-color: rgba(220, 38, 38, 0.35);
+  color: #b91c1c;
+}
+
+:root[data-theme="light"] .trip-delete:hover {
+  background: rgba(239, 68, 68, 0.08);
+}
+
+:root[data-theme="light"] .empty-state {
+  border-color: rgba(15, 23, 42, 0.18);
+  color: #64748b;
+}
+
+:root[data-theme="light"] .empty-state a,
+:root[data-theme="light"] .auth-foot a {
+  color: #1d4ed8;
+}

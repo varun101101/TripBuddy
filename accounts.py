@@ -1,37 +1,3 @@
-"""
-Accounts for TripBuddy, powered by Clerk.
-
-Who does what
-- Clerk handles sign-up, log-in, Google sign-in, email verification and
-  password reset. User accounts (names, emails, passwords) live at Clerk.
-- TripBuddy's PostgreSQL stores the trips and plans, each tagged with the
-  Clerk user ID of its owner (a string like "user_2abc...").
-
-How a request is recognised
-1. In the browser, Clerk issues a short-lived session token (a JWT signed
-   by Clerk with RS256). static/account.js attaches it to every /api call
-   as "Authorization: Bearer <token>".
-2. The server checks that token here, with Clerk's public key: the
-   signature, the expiry, and that it was issued for this site (azp).
-3. If it's valid, the token's "sub" claim is the Clerk user ID, and that ID
-   is used to save and find the user's trips.
-
-Accounts are optional. Guests can still use everything, and if Clerk isn't
-configured or can't be reached, TripBuddy simply works in guest mode.
-
-Database (added beside the existing tables; nothing existing changes, so
-older versions of the app keep working on the same database):
-- trip_members.clerk_user_id   which Clerk user a group-trip member is
-- solo_plans                   one row per solo plan a signed-in user made
-
-.env settings
-- CLERK_PUBLISHABLE_KEY   required to turn accounts on (pk_test_... / pk_live_...)
-- CLERK_JWT_KEY           optional: the "JWKS Public Key" (PEM) from the Clerk
-                          dashboard, to check tokens without a network call
-- CLERK_AUTHORIZED_PARTIES optional: extra site origins allowed to send
-                          tokens, comma separated. This site is always allowed.
-"""
-
 from __future__ import annotations
 
 import base64
@@ -46,7 +12,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from dotenv import load_dotenv
 from fastapi import Request
 
-from group_store import _clean, pool
+from group_store import PLANNING, PROCESSING, TripError, _clean, _lock_trip, pool
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -273,3 +239,48 @@ def my_trips(user_id: str) -> dict[str, list[dict[str, Any]]]:
         "group_trips": [_clean(r) for r in group_rows],
         "solo_plans": [_clean(r) for r in plan_rows],
     }
+
+
+# ---------------------------------------------------------------------
+# Deleting from "My trips"
+# ---------------------------------------------------------------------
+def delete_solo_plan(user_id: str, thread_id: str) -> bool:
+    """Delete one of this user's saved solo plans. False if it isn't theirs."""
+    with pool().connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM solo_plans WHERE thread_id = %s AND clerk_user_id = %s",
+            (thread_id, user_id),
+        )
+    return cur.rowcount == 1
+
+
+def remove_group_trip(user_id: str, trip_id: str) -> tuple[str, list[str]]:
+    """
+    The organiser deletes the trip for everyone: the trip, its members and
+    votes go (and the caller removes the plan threads returned). Any other
+    member only takes it off their own "My trips"; they stay in the group,
+    so the group's votes still work.
+
+    Returns ("deleted", thread_ids) or ("removed", []).
+    """
+    with pool().connection() as conn:
+        trip = _lock_trip(conn, trip_id)
+        member = conn.execute(
+            "SELECT member_id, is_organiser FROM trip_members WHERE trip_id = %s AND clerk_user_id = %s",
+            (trip_id, user_id),
+        ).fetchone()
+        if member is None:
+            raise TripError("This trip isn't in your account.", 404)
+
+        if not member["is_organiser"]:
+            conn.execute(
+                "UPDATE trip_members SET clerk_user_id = NULL WHERE member_id = %s",
+                (member["member_id"],),
+            )
+            return "removed", []
+
+        if trip["status"] in (PLANNING, PROCESSING):
+            raise TripError("The agents are working on this trip right now. Try again in a minute.", 409)
+        conn.execute("DELETE FROM trips WHERE trip_id = %s", (trip_id,))  # members and votes cascade
+        threads = [f"trip_{trip_id}_{n}" for n in range(1, trip["plan_attempts"] + 1)]
+        return "deleted", threads

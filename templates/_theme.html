@@ -1,0 +1,7 @@
+{# Light/dark mode. Keep this last in <head>: the saved theme is applied before the
+   page is drawn (no flash), and theme.css must load after the other stylesheets. #}
+<script>
+  try { if (localStorage.getItem("tripbuddy-theme") === "light") document.documentElement.dataset.theme = "light"; } catch (e) {}
+</script>
+<link rel="stylesheet" href="/static/theme.css">
+<script defer src="/static/theme.js"></script>

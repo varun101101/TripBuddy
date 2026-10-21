@@ -6,6 +6,7 @@
     <title>TripBuddy AI</title>
     <link rel="stylesheet" href="/static/style.css" />
     <link rel="stylesheet" href="/static/account.css" />
+    {% include "_theme.html" %}
   </head>
   <body>
     <div class="page-bg">
@@ -62,7 +63,7 @@
           <button
             onclick="
               setPrompt(
-                'Plan a complete 7 days Japan trip from Bangladesh including flights, hotels and sightseeing under 2 lakhs.',
+                'Plan a complete 7 days Japan trip from Ahmedabad including flights, hotels and sightseeing under 2 lakhs.',
               )
             "
           >
@@ -71,7 +72,7 @@
           <button
             onclick="
               setPrompt(
-                'Plan a 5 days Dubai trip from Dhaka with flights, hotels and sightseeing.',
+                'Plan a 5 days Dubai trip from Ahmedabad with flights, hotels and sightseeing.',
               )
             "
           >
@@ -80,14 +81,11 @@
           <button
             onclick="
               setPrompt(
-                'Plan a 7 days Thailand trip from Bangladesh with budget hotels and sightseeing.',
+                'Plan a 7 days Thailand trip from Ahmedabad with budget hotels and sightseeing.',
               )
             "
           >
             Thailand Trip
-          </button>
-          <button onclick="setPrompt('Give me all country flight info.')">
-            Global Flights
           </button>
         </div>
       </section>
@@ -165,8 +163,8 @@
     </main>
 
     <footer>
-      Built with FastAPI, LangGraph, OpenRouter, PostgreSQL, Tavily, AviationStack and
-      MCP
+      Built with FastAPI, LangGraph, OpenRouter, PostgreSQL, Tavily,
+      AviationStack and MCP
     </footer>
 
     <script src="/static/pdf_export.js?v=2"></script>

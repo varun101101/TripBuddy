@@ -192,3 +192,77 @@ def test_solo_plans_saved_for_signed_in_users_only(env):
     guest = device()
     assert guest.post("/api/travel", json={"message": "Plan 2 days in Udaipur"}).json()["success"]
     assert guest.get("/api/me/trips").status_code == 401
+
+
+# ---------------------------------------------------------------------
+# Deleting from "My trips"
+# ---------------------------------------------------------------------
+def _checkpoint_rows(thread_id):
+    import psycopg
+
+    with psycopg.connect(TEST_DB) as conn:
+        return conn.execute("SELECT count(*) FROM checkpoints WHERE thread_id = %s",
+                            (thread_id,)).fetchone()[0]
+
+
+def test_deleting_a_solo_plan_removes_it_and_its_saved_steps(env):
+    user = new_user()
+    client = device(user)
+    thread = client.post("/api/travel", json={"message": "Plan 2 days in Udaipur"}).json()["thread_id"]
+    assert _checkpoint_rows(thread) > 0
+
+    assert device().delete(f"/api/me/plans/{thread}").status_code == 401            # guest
+    assert device(new_user()).delete(f"/api/me/plans/{thread}").status_code == 404  # someone else
+
+    assert client.delete(f"/api/me/plans/{thread}").json()["success"]
+    assert client.get("/api/me/trips").json()["solo_plans"] == []
+    assert client.get(f"/api/me/plans/{thread}").status_code == 404
+    assert _checkpoint_rows(thread) == 0
+
+
+def test_organiser_deletes_a_group_trip_for_everyone(env):
+    varun = new_user()
+    organiser = device(varun)
+    trip_id, organiser_key = create_trip(organiser)
+    riya = new_user()
+    join(device(riya), trip_id, person("Riya"))
+    organiser.post(f"/api/trips/{trip_id}/plan", json={"member_id": organiser_key})
+    assert _checkpoint_rows(f"trip_{trip_id}_1") > 0
+
+    r = organiser.delete(f"/api/me/trips/{trip_id}")
+    assert r.json() == {"success": True, "outcome": "deleted"}
+    assert organiser.get(f"/api/trips/{trip_id}").status_code == 404
+    assert device(riya).get("/api/me/trips").json()["group_trips"] == []
+    assert _checkpoint_rows(f"trip_{trip_id}_1") == 0
+
+
+def test_member_removes_a_group_trip_only_from_their_own_list(env):
+    varun, riya = new_user(), new_user()
+    trip_id, _ = create_trip(device(varun))
+    riya_device = device(riya)
+    riya_key = join(riya_device, trip_id, person("Riya"))
+
+    r = riya_device.delete(f"/api/me/trips/{trip_id}")
+    assert r.json() == {"success": True, "outcome": "removed"}
+    assert riya_device.get("/api/me/trips").json()["group_trips"] == []
+
+    # The trip and Riya's place in it are untouched, so votes still work
+    trips = device(varun).get("/api/me/trips").json()["group_trips"]
+    assert [(t["trip_id"], t["members"]) for t in trips] == [(trip_id, 2)]
+    guest_view = device().get(f"/api/trips/{trip_id}", params={"member_id": riya_key}).json()
+    assert guest_view["you"]["name"] == "Riya"
+
+    assert device(new_user()).delete(f"/api/me/trips/{trip_id}").status_code == 404
+
+
+def test_trip_cannot_be_deleted_while_agents_are_working_on_it(env):
+    import psycopg
+
+    varun = new_user()
+    organiser = device(varun)
+    trip_id, _ = create_trip(organiser)
+    with psycopg.connect(TEST_DB, autocommit=True) as conn:
+        conn.execute("UPDATE trips SET status = 'planning', updated_at = now() WHERE trip_id = %s",
+                     (trip_id,))
+    assert organiser.delete(f"/api/me/trips/{trip_id}").status_code == 409
+    assert organiser.get(f"/api/trips/{trip_id}").status_code == 200

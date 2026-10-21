@@ -92,7 +92,10 @@
     if (!bar || !config) return;
     const clerk = await clerkReady;
     const user = await ready;
-    bar.replaceChildren();
+    // Clear the account items but keep the light/dark toggle (static/theme.js)
+    for (const child of [...bar.children]) {
+      if (!child.classList.contains("theme-toggle")) child.remove();
+    }
     if (!clerk) return; // Clerk unreachable: stay quiet, guest mode still works
 
     if (!user) {

@@ -1105,3 +1105,8 @@ def get_group_plan(thread_id: str):
     if interrupts:
         result["__interrupt__"] = interrupts
     return _serialize_result(result, thread_id)
+
+
+def delete_plan_history(thread_id: str) -> None:
+    """Remove every saved LangGraph step of a plan (used when a user deletes it)."""
+    checkpointer.delete_thread(thread_id)

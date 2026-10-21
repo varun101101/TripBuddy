@@ -11,10 +11,10 @@ import operator
 import uuid
 import asyncio
 import json
-import psycopg
 from psycopg.rows import dict_row
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
+from db_pool import make_pool
 from langgraph.types import Command, interrupt
 from langchain_core.messages import (
     AnyMessage,
@@ -900,12 +900,16 @@ graph.add_edge("guardrail_blocked", END)
 # PostgreSQL Checkpointer - original persistence kept
 # =========================
 DATABASE_URL = get_database_url()
-_conn = psycopg.connect(
+# A small pool rather than one permanent connection: hosted Postgres closes
+# idle connections, and a single closed connection used to break every plan
+# ("the connection is closed") until the server was restarted. See db_pool.py.
+checkpoint_pool = make_pool(
     DATABASE_URL,
-    autocommit=True,
-    row_factory=dict_row,
+    min_size=1,
+    max_size=5,
+    kwargs={"autocommit": True, "row_factory": dict_row},
 )
-checkpointer = PostgresSaver(_conn)
+checkpointer = PostgresSaver(checkpoint_pool)
 checkpointer.setup()
 
 travel_graph = graph.compile(checkpointer=checkpointer)

@@ -24,6 +24,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from db_pool import make_pool
 from group_logic import APPROVAL_RULES, FOOD_PREFERENCES
 
 # Status values a trip moves through.
@@ -118,12 +119,12 @@ _pool: ConnectionPool | None = None
 def pool() -> ConnectionPool:
     global _pool
     if _pool is None:
-        _pool = ConnectionPool(
+        # Tests idle connections before reuse; see db_pool.py
+        _pool = make_pool(
             _database_url(),
             min_size=1,
             max_size=5,
             kwargs={"row_factory": dict_row},
-            open=True,
         )
     return _pool
 
